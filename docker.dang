@@ -1,0 +1,176 @@
+"""
+A Dagger module for building and linting containers from Dockerfiles.
+
+https://dagger.io
+https://docs.docker.com/reference/dockerfile/
+"""
+type Docker {
+  """
+  Image used for Dockerfile linting.
+  """
+  pub lintImage: String! = "docker.io/hadolint/hadolint:v2.14.0-alpine"
+
+  """
+  Return every Docker project discovered from workspace Dockerfiles.
+  """
+  pub projects(ws: Workspace!): [DockerProject!]! {
+    ws
+      .directory("/", include: ["**/Dockerfile"])
+      .glob("**/Dockerfile")
+      .map { dockerfilePath =>
+        if (dockerfilePath == "Dockerfile") { "." } else {
+          dockerfilePath.trimSuffix("/Dockerfile")
+        }
+      }
+      .map { projectPath =>
+        DockerProject(path: projectPath, lintImage: lintImage)
+      }
+  }
+
+  """
+  Return the Docker project containing a workspace path.
+
+  By default, path may be a project root or a directory inside a project. Set
+  findUp to false when path is already a project root and no lookup is needed.
+  """
+  pub project(ws: Workspace!, path: String!, findUp: Boolean! = true): DockerProject! {
+    DockerProject(
+      path: if (findUp) {
+        let foundDockerfilePath = ws.findUp("Dockerfile", path)
+        if (foundDockerfilePath == null) {
+          raise "no Docker project found containing path: " + path
+        } else {
+          let dockerfilePath = foundDockerfilePath.trimPrefix("/")
+          if (dockerfilePath == "Dockerfile") { "." } else {
+            dockerfilePath.trimSuffix("/Dockerfile")
+          }
+        }
+      } else {
+        path.trimPrefix("/")
+      },
+      lintImage: lintImage,
+    )
+  }
+
+  """
+  Lint every discovered Dockerfile.
+  """
+  pub lintAll(ws: Workspace!): Void @check {
+    let layers = projects(ws).reduce(directory) { layers, project =>
+      layers.withDirectory(
+        project.path,
+        directory.withFile("Dockerfile", project.lintExec(ws).file(project.dockerfilePath)),
+      )
+    }
+    # FIXME: replace this when Dagger can directly run multiple containers in
+    # parallel. For now, merge one file from each project's lint container into
+    # a directory and sync it to force every lint command to run.
+
+    layers.sync
+    null
+  }
+
+  """
+  Build every discovered Docker project.
+  """
+  pub buildAll(ws: Workspace!): Void @check {
+    let layers = projects(ws).reduce(directory) { layers, project =>
+      layers.withDirectory(project.path, project.build(ws).rootfs)
+    }
+    # FIXME: replace this when Dagger can directly run multiple containers in
+    # parallel. For now, merge each built container's rootfs into a directory
+    # and sync it to force every build to run.
+
+    layers.sync
+    null
+  }
+
+}
+
+"""
+A Docker project rooted at a workspace-relative path containing a Dockerfile.
+"""
+type DockerProject {
+  """
+  Workspace-relative path of this project root.
+  """
+  pub path: String!
+
+  """
+  Image used for Dockerfile linting.
+  """
+  let lintImage: String!
+
+  """
+  Return a workspace-root path for a project-relative subpath.
+  """
+  let subpath(relativePath: String!): String! {
+    if (path == ".") {
+      relativePath
+    } else {
+      path.trimSuffix("/") + "/" + relativePath
+    }
+  }
+
+  """
+  Absolute workspace path for this project root.
+  """
+  let workspacePath: String! {
+    if (path == ".") { "/" } else { "/" + path.trimSuffix("/") }
+  }
+
+  """
+  Workspace-relative path of this project's Dockerfile.
+  """
+  pub dockerfilePath: String! {
+    subpath("Dockerfile")
+  }
+
+  """
+  Build context mounted for this project's Docker commands.
+  """
+  pub buildContext(ws: Workspace!): Directory! {
+    ws.directory(workspacePath)
+  }
+
+  """
+  Build the container from this project's Dockerfile.
+  """
+  pub build(
+    ws: Workspace!,
+    """
+    Target build stage to build.
+    """
+    target: String! = "",
+    """
+    Platform to build for, e.g. "linux/amd64". Defaults to the host platform.
+    """
+    platform: String = null,
+  ): Container! {
+    if (platform == null) {
+      buildContext(ws).dockerBuild(target: target)
+    } else {
+      buildContext(ws).dockerBuild(target: target, platform: platform :: Platform!)
+    }
+  }
+
+  """
+  Lint this project's Dockerfile.
+  """
+  pub lint(ws: Workspace!): Void @check {
+    lintExec(ws).sync
+    null
+  }
+
+  """
+  Container synced by this project's lint check.
+  """
+  let lintExec(ws: Workspace!): Container! {
+    container
+      .from(lintImage)
+      .withWorkdir("/src")
+      .withDirectory(".", ws.directory("/", include: [dockerfilePath]))
+      .withExec(["hadolint", dockerfilePath])
+  }
+
+}

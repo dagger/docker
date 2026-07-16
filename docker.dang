@@ -85,6 +85,341 @@ type Docker {
     null
   }
 
+  """
+  Build every named Dockerfile stage that no other stage references.
+
+  A default build only exercises the final stage and its dependency chain;
+  this check covers the stages a default build never reaches, such as test
+  or lint stages.
+  """
+  pub buildUnrefStages(ws: Workspace!): Void @check {
+    let layers = projects(ws).reduce(directory) { projectLayers, project =>
+      project
+        .stages(ws)
+        .filter { stage => stage.name != null and stage.referenced == false }
+        .reduce(projectLayers) { stageLayers, stage =>
+          stageLayers.withDirectory(
+            project.subpath(stage.name ?? ""),
+            stage.build(ws).rootfs,
+          )
+        }
+    }
+    # FIXME: replace this when Dagger can directly run multiple containers in
+    # parallel. For now, merge each built stage's rootfs into a directory and
+    # sync it to force every stage build to run.
+
+    layers.sync
+    null
+  }
+
+  """
+  Spawn an ephemeral Docker Engine in a container.
+  """
+  pub engine(
+    """
+    Docker Engine version.
+    """
+    version: String! = "24.0",
+    """
+    Persist the state of the engine in a cache volume.
+    """
+    persist: Boolean! = true,
+    """
+    Namespace for persisting the engine state. Use in combination with persist.
+    """
+    namespace: String! = "",
+  ): Service! @up {
+    let base = container
+      .from("index.docker.io/docker:" + version + "-dind")
+      .withoutEntrypoint
+      .withExposedPort(2375)
+    let engineContainer = if (persist) {
+      let volumeName = "docker-engine-state-" + version + (
+        if (namespace == "") { "" } else { "-" + namespace }
+      )
+      base.withMountedCache("/var/lib/docker", cacheVolume(volumeName), sharing: LOCKED)
+    } else {
+      base
+    }
+    engineContainer.asService(
+      args: [
+        "dockerd",
+        "--host=tcp://0.0.0.0:2375",
+        "--host=unix:///var/run/docker.sock",
+        "--tls=false",
+      ],
+      insecureRootCapabilities: true,
+    )
+  }
+
+  """
+  A Docker CLI ready to query this engine.
+  """
+  pub cli(
+    """
+    Version of the Docker CLI to run.
+    """
+    version: String! = "24.0",
+    """
+    Specify the Docker Engine to connect to. By default, run an ephemeral engine.
+    """
+    engine: Service = null,
+  ): CLI! {
+    CLI(engine: engine ?? self.engine(version: version))
+  }
+
+}
+
+"""
+A Docker client.
+"""
+type CLI {
+  """
+  The Docker Engine this client is wired to.
+  """
+  pub engine: Service!
+
+  """
+  Package the Docker CLI into a container, wired to an engine.
+  """
+  pub container: Container! {
+    Dagger.container
+      .from("index.docker.io/docker:cli")
+      .withoutEntrypoint
+      .withServiceBinding("dockerd", engine)
+      .withEnvVariable("DOCKER_HOST", "tcp://dockerd:2375")
+  }
+
+  """
+  Execute 'docker pull'.
+  """
+  pub pull(
+    """
+    The docker repository to pull from. Example: registry.dagger.io/engine
+    """
+    repository: String!,
+    """
+    The docker image tag to pull.
+    """
+    tag: String! = "latest",
+  ): Image! {
+    load(Dagger.container.from(repository + ":" + tag))
+  }
+
+  """
+  Execute 'docker push'.
+  """
+  pub push(
+    """
+    The docker repository to push to.
+    """
+    repository: String!,
+    """
+    The tag to push to.
+    """
+    tag: String! = "latest",
+  ): String! {
+    image(repository: repository, tag: tag).push
+  }
+
+  """
+  Execute 'docker pull' and return the CLI state, for chaining.
+  """
+  pub withPull(repository: String!, tag: String! = "latest"): CLI! {
+    pull(repository, tag)
+    self
+  }
+
+  """
+  Execute 'docker push' and return the CLI state, for chaining.
+  """
+  pub withPush(repository: String!, tag: String! = "latest"): CLI! {
+    push(repository, tag)
+    self
+  }
+
+  """
+  Load a container into the Docker Engine cache (docker load).
+  """
+  pub load(
+    """
+    The container to load.
+    """
+    ctr: Container!,
+  ): Image! {
+    let out = self.container
+      .withMountedFile("/import.tar", ctr.asTarball)
+      .withExec(["docker", "load", "-q", "-i", "/import.tar"])
+      .stdout
+    let m = out.match("Loaded image ID: (sha256:[a-fA-F0-9]{64})")
+    if (m == null) {
+      raise "docker load failed or went undetected"
+    } else {
+      let id = m.captures[0]
+      if (id == null) {
+        raise "docker load failed or went undetected"
+      } else {
+        Image(client: self, localID: id)
+      }
+    }
+  }
+
+  """
+  Look up an image in the local Docker Engine cache.
+  If exactly one image matches the filters, return it. Otherwise, raise an error.
+  """
+  pub image(
+    """
+    Filter by image repository.
+    """
+    repository: String! = "",
+    """
+    Filter by image tag.
+    """
+    tag: String! = "latest",
+    """
+    Filter by image local ID (short IDs are allowed).
+    """
+    localID: String! = "",
+  ): Image! {
+    let matches = images(repository: repository, tag: tag, localID: localID)
+    let criteria = "repository=" + repository + " tag=" + tag + " id=" + localID
+    if (matches.length > 1) {
+      raise "more than one image matches the search criteria: " + criteria
+    }
+    let found = matches[0]
+    if (found == null) {
+      raise "no image matches the search criteria: " + criteria
+    } else {
+      found
+    }
+  }
+
+  """
+  List images in the local Docker Engine cache.
+  """
+  pub images(
+    """
+    Filter by image repository.
+    """
+    repository: String! = "",
+    """
+    Filter by image tag.
+    """
+    tag: String! = "",
+    """
+    Filter by image local ID.
+    """
+    localID: String! = "",
+  ): [Image!]! {
+    self.container
+      .withExec(["docker", "image", "list", "-a", "--no-trunc", "--format", "{{json .}}"])
+      .stdout
+      .split("\n")
+      .filter { line => line != "" }
+      .map { line =>
+        fromJSON(line) :: {{ID: String!, Repository: String!, Tag: String!}}!
+      }
+      .filter { info =>
+        (repository == "" or repository == info.Repository) and
+        (tag == "" or tag == info.Tag) and
+        (localID == "" or info.ID.hasPrefix(localID))
+      }
+      .map { info =>
+        Image(client: self, localID: info.ID, repository: info.Repository, tag: info.Tag)
+      }
+  }
+
+  """
+  Run a container with the docker CLI.
+  """
+  pub run(
+    """
+    Name of the image to run. Example: registry.dagger.io/engine
+    """
+    name: String!,
+    """
+    Tag of the image to run.
+    """
+    tag: String! = "latest",
+    """
+    Additional arguments.
+    """
+    args: [String!]! = [],
+  ): String! {
+    self.container.withExec(["docker", "run", name + ":" + tag] + args).stdout
+  }
+
+}
+
+"""
+An image stored in the local Docker Engine cache.
+"""
+type Image {
+  let client: CLI!
+
+  """
+  The local identifier of the docker image.
+  """
+  pub localID: String!
+
+  """
+  The image repository.
+  """
+  pub repository: String! = ""
+
+  """
+  The image tag.
+  """
+  pub tag: String! = ""
+
+  """
+  Export this image from the docker engine into Dagger.
+  """
+  pub export: Container! {
+    let archive = client.container
+      .withExec(["docker", "image", "save", "-o", "/export.tar", localID])
+      .file("/export.tar")
+    Dagger.container.import(archive)
+  }
+
+  """
+  Duplicate this image under a new name (docker tag).
+  """
+  pub duplicate(
+    """
+    The repository name to apply.
+    """
+    repository: String!,
+    """
+    The new tag to apply.
+    """
+    tag: String!,
+  ): Image! {
+    if (localID == "") {
+      raise "can't tag image: local ID not set"
+    } else {
+      client.container.withExec(["docker", "tag", localID, repository + ":" + tag]).sync
+      Image(client: client, localID: localID, repository: repository, tag: tag)
+    }
+  }
+
+  """
+  Push this image to a registry.
+  """
+  pub push: String! {
+    export.publish(ref)
+  }
+
+  """
+  Return the image's ref (remote address).
+  """
+  pub ref: String! {
+    let refTag = if (tag == "") { "latest" } else { tag }
+    let address = repository + ":" + refTag
+    if (localID == "") { address } else { address + "@" + localID }
+  }
+
 }
 
 """
@@ -155,6 +490,51 @@ type DockerProject {
   }
 
   """
+  Build stages declared in this project's Dockerfile, in declaration order.
+
+  Stages are parsed from FROM instructions as described in the Dockerfile
+  reference (https://docs.docker.com/reference/dockerfile/). Parsing is
+  line-based: a FROM inside a heredoc or after a line continuation is not
+  distinguished from a real instruction.
+  """
+  pub stages(ws: Workspace!): [DockerfileStage!]! {
+    let contents = ws
+      .directory("/", include: [dockerfilePath])
+      .file(dockerfilePath)
+      .contents
+    let fromMatches = contents.matchAll("(?im)^\\s*FROM\\s+(?:--\\S+\\s+)*(\\S+)(?:\\s+AS\\s+(\\S+))?")
+    # Stage references, lowercased since stage names are case-insensitive:
+    # FROM bases, COPY/ADD --from=<ref>, and RUN --mount=...,from=<ref>.
+    let references = fromMatches.map { m => (m.captures[0] ?? "").toLower } +
+      contents.matchAll("(?i)--from=(\\S+)").map { m => (m.captures[0] ?? "").toLower } +
+      contents.matchAll("(?i)[=,]from=([^,\\s]+)").map { m => (m.captures[0] ?? "").toLower }
+    fromMatches.map { m, i =>
+      let stageName = m.captures[1]
+      let name = if (stageName == "" or stageName == null) { null } else { stageName }
+      DockerfileStage(
+        project: self,
+        index: i,
+        base: m.captures[0] ?? "",
+        name: name,
+        referenced: references.contains((name ?? "").toLower) or
+          references.contains(toString(i)),
+      )
+    }
+  }
+
+  """
+  Return the named build stage of this project's Dockerfile.
+  """
+  pub stage(ws: Workspace!, name: String!): DockerfileStage! {
+    let found = stages(ws).filter { candidate => candidate.name == name }[0]
+    if (found == null) {
+      raise "no stage named \"" + name + "\" in " + dockerfilePath
+    } else {
+      found
+    }
+  }
+
+  """
   Lint this project's Dockerfile.
   """
   pub lint(ws: Workspace!): Void @check {
@@ -171,6 +551,58 @@ type DockerProject {
       .withWorkdir("/src")
       .withDirectory(".", ws.directory("/", include: [dockerfilePath]))
       .withExec(["hadolint", dockerfilePath])
+  }
+
+}
+
+"""
+A build stage of a Docker project's Dockerfile.
+"""
+type DockerfileStage {
+  """
+  The Docker project whose Dockerfile declares this stage.
+  """
+  pub project: DockerProject!
+
+  """
+  Zero-based position of this stage in the Dockerfile.
+  """
+  pub index: Int!
+
+  """
+  Image or prior stage this stage builds from.
+  """
+  pub base: String!
+
+  """
+  Stage name declared with AS. Null for unnamed stages.
+  """
+  pub name: String
+
+  """
+  Whether another stage in the Dockerfile references this stage, as a FROM
+  base, a COPY/ADD --from source, or a RUN --mount from source. References by
+  name (case-insensitive) and by stage index are both counted.
+  """
+  pub referenced: Boolean!
+
+  """
+  Build this stage of the project's Dockerfile.
+  """
+  pub build(
+    ws: Workspace!,
+    """
+    Platform to build for, e.g. "linux/amd64". Defaults to the host platform.
+    """
+    platform: String = null,
+  ): Container! {
+    let target = name
+    if (target == null) {
+      raise "cannot build stage " + toString(index) + " of " + project.dockerfilePath +
+        " by target: it has no name"
+    } else {
+      project.build(ws, target: target, platform: platform)
+    }
   }
 
 }

@@ -11,24 +11,22 @@ type Docker {
   pub lintImage: String! = "docker.io/hadolint/hadolint:v2.14.0-alpine"
 
   """
-  Return every Docker project discovered from workspace Dockerfiles.
+  The Docker projects visible from the client's cwd: every directory at or
+  below it holding a Dockerfile, plus the nearest enclosing project when the
+  cwd holds no Dockerfile of its own. Paths are cwd-relative, so a ".." prefix
+  marks an enclosing project.
   """
   pub projects(ws: Workspace!): [DockerProject!]! {
-    ws
-      .directory("/", include: ["**/Dockerfile"])
-      .glob("**/Dockerfile")
-      .map { dockerfilePath =>
-        if (dockerfilePath == "Dockerfile") { "." } else {
-          dockerfilePath.trimSuffix("/Dockerfile")
-        }
-      }
+    polyfill
+      .workspace(ws)
+      .findConfigDirs(["Dockerfile"])
       .map { projectPath =>
         DockerProject(path: projectPath, lintImage: lintImage)
       }
   }
 
   """
-  Return the Docker project containing a workspace path.
+  Return the Docker project containing a path, relative to the client's cwd.
 
   By default, path may be a project root or a directory inside a project. Set
   findUp to false when path is already a project root and no lookup is needed.
@@ -40,77 +38,99 @@ type Docker {
         if (foundDockerfilePath == null) {
           raise "no Docker project found containing path: " + path
         } else {
-          let dockerfilePath = foundDockerfilePath.trimPrefix("/")
-          if (dockerfilePath == "Dockerfile") { "." } else {
-            dockerfilePath.trimSuffix("/Dockerfile")
-          }
+          relativeToCwd(ws, foundDockerfilePath)
         }
       } else {
-        path.trimPrefix("/")
+        path
       },
       lintImage: lintImage,
     )
   }
 
   """
-  Lint every discovered Dockerfile.
+  Return the directory of a workspace-root-absolute file path, relative to the
+  client's cwd: "/a/b/Dockerfile" from cwd "a" is "b", from "a/b/c" is "..".
+  """
+  let relativeToCwd(ws: Workspace!, filePath: String!): String! {
+    let dirSegments = filePath.trimPrefix("/").split("/").dropLast(1)
+    let cwdSegments = ws.path.trimPrefix("/").split("/").filter { segment =>
+      segment != "" and segment != "."
+    }
+    # Longest common prefix: acc only advances while every prior segment matched.
+    let common = cwdSegments.map { segment, i => i }.reduce(0) { acc, i =>
+      if (acc == i and dirSegments[i] == cwdSegments[i]) { acc + 1 } else { acc }
+    }
+    let segments = cwdSegments.dropFirst(common).map { segment => ".." } +
+      dirSegments.dropFirst(common)
+    if (segments.length == 0) { "." } else { segments.join("/") }
+  }
+
+  """
+  Lint the Dockerfile of every project visible from the client's cwd. A cwd
+  holding no Dockerfile of its own sits inside its enclosing project, so that
+  project is linted too; enter a subproject to lint it alone.
   """
   pub lintAll(ws: Workspace!): Void @check {
-    let layers = projects(ws).reduce(directory) { layers, project =>
-      layers.withDirectory(
-        project.path,
-        directory.withFile("Dockerfile", project.lintExec(ws).file(project.dockerfilePath)),
-      )
-    }
+    let layers = projects(ws).map { project, i =>
+      directory.withFile(toString(i) + "/Dockerfile", project.lintExec(ws).file("Dockerfile"))
+    }.reduce(directory) { merged, layer => merged.withDirectory(".", layer) }
     # FIXME: replace this when Dagger can directly run multiple containers in
     # parallel. For now, merge one file from each project's lint container into
-    # a directory and sync it to force every lint command to run.
+    # a directory (keyed by project position, since a cwd-relative ".." path
+    # is not a valid directory name) and sync it to force every lint command
+    # to run.
 
     layers.sync
     null
   }
 
   """
-  Build every discovered Docker project.
+  Build every project visible from the client's cwd. A cwd holding no
+  Dockerfile of its own sits inside its enclosing project, so that project is
+  built too; enter a subproject to build it alone.
   """
   pub buildAll(ws: Workspace!): Void @check {
-    let layers = projects(ws).reduce(directory) { layers, project =>
-      layers.withDirectory(project.path, project.build(ws).rootfs)
-    }
+    let layers = projects(ws).map { project, i =>
+      directory.withDirectory(toString(i), project.build(ws).rootfs)
+    }.reduce(directory) { merged, layer => merged.withDirectory(".", layer) }
     # FIXME: replace this when Dagger can directly run multiple containers in
     # parallel. For now, merge each built container's rootfs into a directory
-    # and sync it to force every build to run.
+    # (keyed by project position, since a cwd-relative ".." path is not a
+    # valid directory name) and sync it to force every build to run.
 
     layers.sync
     null
   }
 
   """
-  Build every named Dockerfile stage that no other stage references.
+  Build every named Dockerfile stage that no other stage references, across
+  the projects visible from the client's cwd.
 
   A default build only exercises the final stage and its dependency chain;
   this check covers the stages a default build never reaches, such as test
   or lint stages.
   """
   pub buildUnrefStages(ws: Workspace!): Void @check {
-    let layers = projects(ws).reduce(directory) { projectLayers, project =>
+    let layers = projects(ws).map { project, i =>
       project
         .stages(ws)
         .filter { stage => stage.name != null and stage.referenced == false }
-        .reduce(projectLayers) { stageLayers, stage =>
+        .reduce(directory) { stageLayers, stage =>
           stageLayers.withDirectory(
-            project.subpath(stage.name ?? ""),
+            toString(i) + "/" + (stage.name ?? ""),
             stage.build(ws).rootfs,
           )
         }
-    }
+    }.reduce(directory) { merged, layer => merged.withDirectory(".", layer) }
     # FIXME: replace this when Dagger can directly run multiple containers in
-    # parallel. For now, merge each built stage's rootfs into a directory and
-    # sync it to force every stage build to run.
+    # parallel. For now, merge each built stage's rootfs into a directory
+    # (keyed by project position, since a cwd-relative ".." path is not a
+    # valid directory name) and sync it to force every stage build to run.
 
     layers.sync
     null
   }
+
 
   """
   Spawn an ephemeral Docker Engine in a container.
@@ -128,7 +148,7 @@ type Docker {
     Namespace for persisting the engine state. Use in combination with persist.
     """
     namespace: String! = "",
-  ): Service! @up {
+  ): Service! {
     let base = container
       .from("index.docker.io/docker:" + version + "-dind")
       .withoutEntrypoint
@@ -423,11 +443,12 @@ type Image {
 }
 
 """
-A Docker project rooted at a workspace-relative path containing a Dockerfile.
+A Docker project rooted at a directory containing a Dockerfile.
 """
 type DockerProject {
   """
-  Workspace-relative path of this project root.
+  Path of this project root, relative to the client's cwd. A ".." prefix
+  marks an enclosing project.
   """
   pub path: String!
 
@@ -437,7 +458,7 @@ type DockerProject {
   let lintImage: String!
 
   """
-  Return a workspace-root path for a project-relative subpath.
+  Return a cwd-relative path for a project-relative subpath.
   """
   let subpath(relativePath: String!): String! {
     if (path == ".") {
@@ -448,14 +469,7 @@ type DockerProject {
   }
 
   """
-  Absolute workspace path for this project root.
-  """
-  let workspacePath: String! {
-    if (path == ".") { "/" } else { "/" + path.trimSuffix("/") }
-  }
-
-  """
-  Workspace-relative path of this project's Dockerfile.
+  Cwd-relative path of this project's Dockerfile.
   """
   pub dockerfilePath: String! {
     subpath("Dockerfile")
@@ -465,7 +479,7 @@ type DockerProject {
   Build context mounted for this project's Docker commands.
   """
   pub buildContext(ws: Workspace!): Directory! {
-    ws.directory(workspacePath)
+    ws.directory(path)
   }
 
   """
@@ -498,10 +512,7 @@ type DockerProject {
   distinguished from a real instruction.
   """
   pub stages(ws: Workspace!): [DockerfileStage!]! {
-    let contents = ws
-      .directory("/", include: [dockerfilePath])
-      .file(dockerfilePath)
-      .contents
+    let contents = ws.file(dockerfilePath).contents
     let fromMatches = contents.matchAll("(?im)^\\s*FROM\\s+(?:--\\S+\\s+)*(\\S+)(?:\\s+AS\\s+(\\S+))?")
     # Stage references, lowercased since stage names are case-insensitive:
     # FROM bases, COPY/ADD --from=<ref>, and RUN --mount=...,from=<ref>.
@@ -549,8 +560,8 @@ type DockerProject {
     container
       .from(lintImage)
       .withWorkdir("/src")
-      .withDirectory(".", ws.directory("/", include: [dockerfilePath]))
-      .withExec(["hadolint", dockerfilePath])
+      .withDirectory(".", ws.directory(path, include: ["Dockerfile"]))
+      .withExec(["hadolint", "Dockerfile"])
   }
 
 }

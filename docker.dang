@@ -85,9 +85,7 @@ type Docker {
   }
 
   """
-  Build every project visible from the client's cwd. A cwd holding no
-  Dockerfile of its own sits inside its enclosing project, so that project is
-  built too; enter a subproject to build it alone.
+  Build every project visible from the client's cwd.
   """
   pub buildAll(ws: Workspace!): Void @check {
     let layers = projects(ws).map { project, i =>
@@ -103,8 +101,7 @@ type Docker {
   }
 
   """
-  Build every named Dockerfile stage that no other stage references, across
-  the projects visible from the client's cwd.
+  Build every named Dockerfile stage that no other stage references.
 
   A default build only exercises the final stage and its dependency chain;
   this check covers the stages a default build never reaches, such as test
@@ -170,6 +167,13 @@ type Docker {
       ],
       insecureRootCapabilities: true,
     )
+  }
+
+  """
+  Tools for validating Docker Compose projects.
+  """
+  pub compose: Compose! {
+    Compose()
   }
 
   """

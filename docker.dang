@@ -1,5 +1,5 @@
 """
-A Dagger module for building and linting containers from Dockerfiles.
+A Dagger module for working with Docker and Docker Compose projects.
 
 https://dagger.io
 https://docs.docker.com/reference/dockerfile/
@@ -407,26 +407,6 @@ type Image {
     Dagger.container.import(archive)
   }
 
-  """
-  Duplicate this image under a new name (docker tag).
-  """
-  pub duplicate(
-    """
-    The repository name to apply.
-    """
-    repository: String!,
-    """
-    The new tag to apply.
-    """
-    tag: String!,
-  ): Image! {
-    if (localID == "") {
-      raise "can't tag image: local ID not set"
-    } else {
-      client.container.withExec(["docker", "tag", localID, repository + ":" + tag]).sync
-      Image(client: client, localID: localID, repository: repository, tag: tag)
-    }
-  }
 
   """
   Push this image to a registry.

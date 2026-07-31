@@ -3,3 +3,11 @@
 
 [modules.dang-sdk]
 source = "github.com/dagger/dang-sdk"
+
+[modules.proxy]
+source = "../proxy-module"
+# Nginx version used for the default base container.
+# settings.version = ""
+# Base container for the proxy. Must be able to run nginx.
+# Mutually exclusive with version.
+# settings.base = "alpine:latest"

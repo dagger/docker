@@ -35,40 +35,6 @@ type Compose {
       }
   }
 
-  """
-  Return the Compose project containing a path, relative to the client's cwd.
-
-  By default, path may be a project root or a directory inside a project. Set
-  findUp to false when path is already a project root and no lookup is needed.
-  """
-  pub project(ws: Workspace!, path: String!, findUp: Boolean! = true): ComposeProject! {
-    ComposeProject(
-      path: if (findUp) {
-        # Search every config filename and keep the deepest hit, so a farther-up
-        # project never shadows a closer one just because its filename comes
-        # first.
-        let hit = configNames.reduce(null) { best, name =>
-          let found = ws.findUp(name, path)
-          if (found == null) {
-            best
-          } else if (best == null or depth(found) > depth(best ?? "")) {
-            found
-          } else {
-            best
-          }
-        }
-        if (hit == null) {
-          raise "no Compose project found containing path: " + path
-        } else {
-          relativeToCwd(ws, hit)
-        }
-      } else {
-        path
-      },
-      composeImage: composeImage,
-      configNames: configNames,
-    )
-  }
 
   """
   Return the number of path segments of a workspace-root-absolute file path.
@@ -93,6 +59,45 @@ type Compose {
     let segments = cwdSegments.dropFirst(common).map { segment => ".." } +
       dirSegments.dropFirst(common)
     if (segments.length == 0) { "." } else { segments.join("/") }
+  }
+
+  """
+  Run the services of the Compose project detected from the client's cwd,
+  proxied through a single service with one frontend port per compose service.
+
+  Exactly one project must be visible: enter a project directory to choose it.
+  Each service that declares an image and a port is started from its image
+  and proxied on its published port (or its target port when none is
+  published). Services without an image (such as build-only services) are
+  skipped for now.
+  """
+  pub startServices(ws: Workspace!): Service! @up {
+    let detected = projects(ws)
+    if (detected.length > 1) {
+      raise "multiple Compose projects detected (" +
+        detected.map { project => project.path }.join(", ") +
+        "); enter a project directory to choose one"
+    }
+    let single = detected[0]
+    if (single == null) {
+      raise "no Compose project detected"
+    } else {
+      single
+        .serviceSpecs(ws)
+        .filter { spec => spec.image != "" and spec.target != 0 }
+        .reduce(proxy) { front, spec =>
+          front.withService(
+            service: container
+              .from(spec.image)
+              .withExposedPort(spec.target)
+              .asService(useEntrypoint: true),
+            name: spec.name,
+            frontend: if (spec.published == 0) { spec.target } else { spec.published },
+            backend: spec.target,
+          )
+        }
+        .service
+    }
   }
 
   """
@@ -166,6 +171,43 @@ type ComposeProject {
   }
 
   """
+  Name of every service declared by this project's Compose file.
+  """
+  pub services(ws: Workspace!): [String!]! {
+    base(ws)
+      .withExec(["/docker-compose", "-f", configName(ws), "config", "--services"])
+      .stdout
+      .split("\n")
+      .filter { line => line != "" }
+  }
+
+  """
+  Name, image, and first port mapping of every service declared by this
+  project's Compose file. Ports are 0 when the service declares none.
+  """
+  let serviceSpecs(ws: Workspace!): [{{name: String!, image: String!, target: Int!, published: Int!}}!]! {
+    # The compose JSON keys services by name, which type-driven fromJSON can't
+    # parse; jq flattens it to a fixed-shape list first.
+    let specs = container
+      .from("docker.io/library/alpine:3.20")
+      .withExec(["apk", "add", "--no-cache", "jq"])
+      .withFile("/usr/local/bin/docker-compose", container.from(composeImage).file("/docker-compose"))
+      .withWorkdir("/src")
+      .withDirectory(".", ws.directory(path))
+      .withExec([
+        "sh",
+        "-c",
+        "docker-compose -f " + configName(ws) + " config --format json | " +
+          "jq -c '[.services | to_entries[] | {name: .key, " +
+          "image: (.value.image // \"\"), " +
+          "target: (.value.ports[0].target // 0), " +
+          "published: ((.value.ports[0].published // \"0\") | tonumber)}]'",
+      ])
+      .stdout
+    fromJSON(specs)
+  }
+
+  """
   Validate this project's Compose file with 'docker compose config'.
   """
   pub lint(ws: Workspace!): Void @check {
@@ -174,16 +216,22 @@ type ComposeProject {
   }
 
   """
-  Container synced by this project's lint check. The whole project directory
-  is mounted, since Compose files can reference sibling files such as env_file
-  entries during validation.
+  Container synced by this project's lint check.
   """
   let lintExec(ws: Workspace!): Container! {
+    base(ws).withExec(["/docker-compose", "-f", configName(ws), "config", "--quiet"])
+  }
+
+  """
+  Compose container with this project mounted. The whole project directory is
+  mounted, since Compose files can reference sibling files such as env_file
+  entries.
+  """
+  let base(ws: Workspace!): Container! {
     container
       .from(composeImage)
       .withWorkdir("/src")
       .withDirectory(".", ws.directory(path))
-      .withExec(["/docker-compose", "-f", configName(ws), "config", "--quiet"])
   }
 
 }

@@ -5,7 +5,7 @@
 source = "github.com/dagger/dang-sdk"
 
 [modules.proxy]
-source = "../proxy-module"
+source = "https://github.com/dagger/proxy"
 # Nginx version used for the default base container.
 # settings.version = ""
 # Base container for the proxy. Must be able to run nginx.

@@ -66,10 +66,10 @@ type Compose {
   proxied through a single service with one frontend port per compose service.
 
   Exactly one project must be visible: enter a project directory to choose it.
-  Each service that declares an image and a port is started from its image
-  and proxied on its published port (or its target port when none is
-  published). Services without an image (such as build-only services) are
-  skipped for now.
+  Each service that declares a port is started and proxied on its published
+  port (or its target port when none is published): from its image when it
+  declares one, or by building its build context (with any build args) when
+  it declares a build instead. Services with neither are skipped.
   """
   pub startServices(ws: Workspace!): Service! @up {
     let detected = projects(ws)
@@ -84,13 +84,24 @@ type Compose {
     } else {
       single
         .serviceSpecs(ws)
-        .filter { spec => spec.image != "" and spec.target != 0 }
+        .filter { spec => (spec.image != "" or spec.buildContext != "") and spec.target != 0 }
         .reduce(proxy) { front, spec =>
           front.withService(
-            service: container
-              .from(spec.image)
+            service: spec.environment
+              .reduce(
+                if (spec.image != "") {
+                  container.from(spec.image)
+                } else {
+                  single.buildContextDir(ws, spec.buildContext).dockerBuild(
+                    buildArgs: spec.buildArgs.map { arg =>
+                      BuildArg(name: arg.name, value: arg.value)
+                    },
+                  )
+                },
+              ) { ctr, env => ctr.withEnvVariable(env.name, env.value) }
               .withExposedPort(spec.target)
-              .asService(useEntrypoint: true),
+              .asService(useEntrypoint: true)
+              .withHostname(spec.name),
             name: spec.name,
             frontend: if (spec.published == 0) { spec.target } else { spec.published },
             backend: spec.target,
@@ -163,11 +174,7 @@ type ComposeProject {
   Cwd-relative path of this project's Compose file.
   """
   pub configPath(ws: Workspace!): String! {
-    if (path == ".") {
-      configName(ws)
-    } else {
-      path.trimSuffix("/") + "/" + configName(ws)
-    }
+    subpath(configName(ws))
   }
 
   """
@@ -182,12 +189,12 @@ type ComposeProject {
   }
 
   """
-  Name, image, and first port mapping of every service declared by this
-  project's Compose file. Ports are 0 when the service declares none.
+  Name, image, build configuration, and first port mapping of every service
+  declared by this project's Compose file.
   """
-  let serviceSpecs(ws: Workspace!): [{{name: String!, image: String!, target: Int!, published: Int!}}!]! {
-    # The compose JSON keys services by name, which type-driven fromJSON can't
-    # parse; jq flattens it to a fixed-shape list first.
+  let serviceSpecs(ws: Workspace!): [ComposeService!]! {
+    # The compose JSON keys services (and build args) by name, which
+    # type-driven fromJSON can't parse; jq flattens both to fixed shapes first.
     let specs = container
       .from("docker.io/library/alpine:3.20")
       .withExec(["apk", "add", "--no-cache", "jq"])
@@ -201,10 +208,36 @@ type ComposeProject {
           "jq -c '[.services | to_entries[] | {name: .key, " +
           "image: (.value.image // \"\"), " +
           "target: (.value.ports[0].target // 0), " +
-          "published: ((.value.ports[0].published // \"0\") | tonumber)}]'",
+          "published: ((.value.ports[0].published // \"0\") | tonumber), " +
+          "buildContext: (.value.build.context // \"\"), " +
+          "buildArgs: ((.value.build.args // {}) | to_entries | " +
+          "map({name: .key, value: (.value // \"\")})), " +
+          "environment: ((.value.environment // {}) | to_entries | " +
+          "map({name: .key, value: (.value // \"\")}))}]'",
       ])
       .stdout
     fromJSON(specs)
+  }
+
+  """
+  Return the workspace directory of a build context resolved by 'docker
+  compose config', which canonicalizes the context to an absolute path inside
+  the compose container, where the project is mounted at /src.
+  """
+  let buildContextDir(ws: Workspace!, context: String!): Directory! {
+    let relative = context.trimPrefix("/src").trimPrefix("/")
+    ws.directory(if (relative == "") { path } else { subpath(relative) })
+  }
+
+  """
+  Return a cwd-relative path for a project-relative subpath.
+  """
+  let subpath(relativePath: String!): String! {
+    if (path == ".") {
+      relativePath
+    } else {
+      path.trimSuffix("/") + "/" + relativePath
+    }
   }
 
   """
@@ -234,4 +267,76 @@ type ComposeProject {
       .withDirectory(".", ws.directory(path))
   }
 
+}
+
+"""
+A service declared by a Compose project's Compose file.
+"""
+type ComposeService {
+  """
+  Service name.
+  """
+  pub name: String!
+
+  """
+  Image the service runs. Empty when the service declares a build instead.
+  """
+  pub image: String! = ""
+
+  """
+  Container port of the service's first port mapping, 0 when it declares none.
+  """
+  pub target: Int! = 0
+
+  """
+  Published port of the service's first port mapping, 0 when none is
+  published.
+  """
+  pub published: Int! = 0
+
+  """
+  Build context as resolved by 'docker compose config'. Empty when the
+  service runs an image.
+  """
+  pub buildContext: String! = ""
+
+  """
+  Args of the service's build configuration.
+  """
+  pub buildArgs: [ComposeBuildArg!]! = []
+
+  """
+  Environment variables declared by the service.
+  """
+  pub environment: [ComposeEnvVariable!]! = []
+}
+
+"""
+An environment variable declared by a Compose service.
+"""
+type ComposeEnvVariable {
+  """
+  Variable name.
+  """
+  pub name: String!
+
+  """
+  Variable value.
+  """
+  pub value: String! = ""
+}
+
+"""
+A build arg of a Compose service's build configuration.
+"""
+type ComposeBuildArg {
+  """
+  Arg name.
+  """
+  pub name: String!
+
+  """
+  Arg value.
+  """
+  pub value: String! = ""
 }

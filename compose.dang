@@ -27,8 +27,7 @@ type Compose {
   prefix marks an enclosing project.
   """
   pub projects(ws: Workspace!): [ComposeProject!]! {
-    polyfill
-      .workspace(ws)
+    ws
       .findConfigDirs(configNames)
       .map { projectPath =>
         ComposeProject(path: projectPath, composeImage: composeImage, configNames: configNames)
@@ -49,7 +48,7 @@ type Compose {
   """
   let relativeToCwd(ws: Workspace!, filePath: String!): String! {
     let dirSegments = filePath.trimPrefix("/").split("/").dropLast(1)
-    let cwdSegments = ws.path.trimPrefix("/").split("/").filter { segment =>
+    let cwdSegments = ws.cwd.trimPrefix("/").split("/").filter { segment =>
       segment != "" and segment != "."
     }
     # Longest common prefix: acc only advances while every prior segment matched.

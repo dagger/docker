@@ -17,8 +17,7 @@ type Docker {
   marks an enclosing project.
   """
   pub projects(ws: Workspace!): [DockerProject!]! {
-    polyfill
-      .workspace(ws)
+    ws
       .findConfigDirs(["Dockerfile"])
       .map { projectPath =>
         DockerProject(path: projectPath, lintImage: lintImage)
@@ -53,7 +52,7 @@ type Docker {
   """
   let relativeToCwd(ws: Workspace!, filePath: String!): String! {
     let dirSegments = filePath.trimPrefix("/").split("/").dropLast(1)
-    let cwdSegments = ws.path.trimPrefix("/").split("/").filter { segment =>
+    let cwdSegments = ws.cwd.trimPrefix("/").split("/").filter { segment =>
       segment != "" and segment != "."
     }
     # Longest common prefix: acc only advances while every prior segment matched.

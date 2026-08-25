@@ -12,7 +12,8 @@
     },
     {
       "name": "proxy",
-      "source": "./proxy"
+      "source": "https://github.com/dagger/proxy@main",
+      "pin": "3224e8981d8c8f04a0c238dc933b7415a2a6349f"
     }
   ]
 }

@@ -27,9 +27,8 @@ type Compose {
   prefix marks an enclosing project.
   """
   pub projects(ws: Workspace!): [ComposeProject!]! {
-    polyfill
-      .workspace(ws)
-      .findConfigDirs(configNames)
+    ws
+      .findRoots(markers: configNames)
       .map { projectPath =>
         ComposeProject(path: projectPath, composeImage: composeImage, configNames: configNames)
       }

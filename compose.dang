@@ -27,38 +27,11 @@ type Compose {
   prefix marks an enclosing project.
   """
   pub projects(ws: Workspace!): [ComposeProject!]! {
-    polyfill
-      .workspace(ws)
-      .findConfigDirs(configNames)
+    ws
+      .findRoots(markers: configNames)
       .map { projectPath =>
         ComposeProject(path: projectPath, composeImage: composeImage, configNames: configNames)
       }
-  }
-
-
-  """
-  Return the number of path segments of a workspace-root-absolute file path.
-  """
-  let depth(filePath: String!): Int! {
-    filePath.trimPrefix("/").split("/").length
-  }
-
-  """
-  Return the directory of a workspace-root-absolute file path, relative to the
-  client's cwd: "/a/b/compose.yaml" from cwd "a" is "b", from "a/b/c" is "..".
-  """
-  let relativeToCwd(ws: Workspace!, filePath: String!): String! {
-    let dirSegments = filePath.trimPrefix("/").split("/").dropLast(1)
-    let cwdSegments = ws.path.trimPrefix("/").split("/").filter { segment =>
-      segment != "" and segment != "."
-    }
-    # Longest common prefix: acc only advances while every prior segment matched.
-    let common = cwdSegments.map { segment, i => i }.reduce(0) { acc, i =>
-      if (acc == i and dirSegments[i] == cwdSegments[i]) { acc + 1 } else { acc }
-    }
-    let segments = cwdSegments.dropFirst(common).map { segment => ".." } +
-      dirSegments.dropFirst(common)
-    if (segments.length == 0) { "." } else { segments.join("/") }
   }
 
   """

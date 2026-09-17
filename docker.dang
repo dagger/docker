@@ -11,6 +11,16 @@ type Docker {
   pub lintImage: String! = "docker.io/hadolint/hadolint:v2.14.0-alpine"
 
   """
+  Container that Compose services are attached to by injectServices.
+  A blank container by default; override it in dagger.toml, e.g.
+
+    settings.composeBase = ...
+
+  to run the services alongside a container of your choosing.
+  """
+  pub composeBase: Container! = container
+
+  """
   The Docker projects visible from the client's cwd: every directory at or
   below it holding a Dockerfile, plus the nearest enclosing project when the
   cwd holds no Dockerfile of its own. Paths are cwd-relative, so a ".." prefix
@@ -173,6 +183,61 @@ type Docker {
   """
   pub compose: Compose! {
     Compose()
+  }
+
+  """
+  Attach every service declared by the Compose project detected from the
+  client's cwd to the base container as service bindings, then return that
+  container. Each service is reachable from the container by its Compose
+  service name (the binding's hostname).
+
+  Exactly one project must be visible: enter a project directory to choose it.
+  Each service is started from its image when it declares one, or by building
+  its build context (with any build args) when it declares a build instead;
+  services with neither are skipped. A service that declares a port has that
+  container port exposed on its binding.
+
+  The base container is the module's composeBase, blank by default; override
+  it in dagger.toml via settings.composeBase.
+  """
+  pub injectServices(ws: Workspace!): Container! {
+    let detected = compose.projects(ws)
+    if (detected.length > 1) {
+      raise "multiple Compose projects detected (" +
+        detected.map { project => project.path }.join(", ") +
+        "); enter a project directory to choose one"
+    }
+    let single = detected[0]
+    if (single == null) {
+      raise "no Compose project detected"
+    } else {
+      single
+        .serviceSpecs(ws)
+        .filter { spec => spec.image != "" or spec.buildContext != "" }
+        .reduce(composeBase) { ctr, spec =>
+          let built = spec.environment
+            .reduce(
+              if (spec.image != "") {
+                container.from(spec.image)
+              } else {
+                single.buildContextDir(ws, spec.buildContext).dockerBuild(
+                  buildArgs: spec.buildArgs.map { arg =>
+                    BuildArg(name: arg.name, value: arg.value)
+                  },
+                )
+              },
+            ) { c, env => c.withEnvVariable(env.name, env.value) }
+          let exposed = if (spec.target == 0) {
+            built
+          } else {
+            built.withExposedPort(spec.target)
+          }
+          ctr.withServiceBinding(
+            spec.name,
+            exposed.asService(useEntrypoint: true).withHostname(spec.name),
+          )
+        }
+    }
   }
 
   """

@@ -21,6 +21,17 @@ type Docker {
   pub composeBase: Container! = container
 
   """
+  Environment variables added to the compose container by injectServices, as
+  "key=value" pairs. Set them in dagger.toml, e.g.
+
+    settings.composeEnvs = ["LOG_LEVEL=debug"]
+
+  Only the first "=" separates the name from the value, so values may contain
+  "=". An entry with no "=" sets an empty value.
+  """
+  pub composeEnvs: [String!]! = []
+
+  """
   The Docker projects visible from the client's cwd: every directory at or
   below it holding a Dockerfile, plus the nearest enclosing project when the
   cwd holds no Dockerfile of its own. Paths are cwd-relative, so a ".." prefix
@@ -198,7 +209,8 @@ type Docker {
   container port exposed on its binding.
 
   The base container is the module's composeBase, blank by default; override
-  it in dagger.toml via settings.composeBase.
+  it in dagger.toml via settings.composeBase. Any composeEnvs entries are set
+  on it as environment variables.
   """
   pub injectServices(ws: Workspace!): Container! {
     let detected = compose.projects(ws)
@@ -214,7 +226,7 @@ type Docker {
       single
         .serviceSpecs(ws)
         .filter { spec => spec.image != "" or spec.buildContext != "" }
-        .reduce(composeBase) { ctr, spec =>
+        .reduce(composeBaseWithEnvs) { ctr, spec =>
           let built = spec.environment
             .reduce(
               if (spec.image != "") {
@@ -237,6 +249,21 @@ type Docker {
             exposed.asService(useEntrypoint: true).withHostname(spec.name),
           )
         }
+    }
+  }
+
+  """
+  The compose container with composeEnvs applied as environment variables.
+  """
+  let composeBaseWithEnvs: Container! {
+    composeEnvs.reduce(composeBase) { ctr, entry =>
+      let parts = entry.split("=", limit: 2)
+      let name = parts[0] ?? ""
+      if (name == "") {
+        raise "invalid composeEnvs entry (expected \"key=value\"): " + entry
+      } else {
+        ctr.withEnvVariable(name, parts[1] ?? "")
+      }
     }
   }
 

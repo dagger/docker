@@ -141,15 +141,17 @@ stage, `--docker-stage=dev-envs` selects all of them. Add `--docker-project`
 or `--docker-compose-project` to narrow it down.
 
 The selected items run in parallel. Every failure is reported with the
-project, stage or service and the step that failed. The engine's internal
-object IDs are stripped from build errors. The failing Dockerfile step's own
-output is in the trace, not in the message:
+project, stage or service and the step that failed. A build that fails in a
+`RUN` instruction reports its exit code. The instruction's output is in the
+trace, not in the message, because the engine's build error doesn't carry
+it:
 
 ```
 docker build failed in 1 of 2 projects:
-- broken: docker build failed: failed to clone built container state: exit code: 3
-(the failing step's output is in the trace)
+- broken: docker build failed (exit code 3 in a RUN step; see the trace for its output)
 ```
+
+Other build errors are reported without the engine's internal object IDs.
 
 Run checks with `dagger check`, in CI especially: `dagger call` on a check
 function does not fail the command when the check fails.
@@ -186,23 +188,33 @@ arguments come from the `lintArgs` setting, for example
 
 - **Dependencies:** the selected services and every service they
   `depends_on` are started.
-- **Networking:** each service can reach, by service name, every service that
-  starts before it. Services start in `depends_on` order. Among services
-  ready to start, image-only services come first, then by name. Declare
-  `depends_on` when one service must reach another; Dagger service bindings
-  can't form cycles.
+- **Networking:** each service can reach, by service name, only the services
+  that start before it. Dagger service bindings can't form cycles, so
+  Compose's network, where every service reaches every other, can't be
+  reproduced. Services start in `depends_on` order; among services ready to
+  start, image-only services come first, then by name. A service that starts
+  earlier can't reach one that starts later. In prometheus-grafana, for
+  example, `grafana` starts before `prometheus` (by name), so grafana can't
+  reach prometheus unless it declares `depends_on: [prometheus]`. Declare
+  `depends_on` whenever one service must reach another.
 - **Ports:** every published TCP port of every started service is published
-  through one [proxy](https://github.com/dagger/proxy) service, as raw TCP.
-  A port without a published port is published on its target port. Ports
-  from `ports` and `expose` are what Dagger waits for before starting
-  dependents.
+  through one [proxy](https://github.com/dagger/proxy) service, as raw TCP,
+  including the same target port on several published ports. A port without
+  a published port is published on its target port. Two services can't
+  publish the same port, as with Compose. UDP ports are not published (see
+  the warnings below). Ports from `ports` and `expose` are what Dagger waits
+  for before starting dependents.
 - **Container:** each service runs its image, or the image its build context
   builds. Compose's entrypoint, command, environment (including `env_file`),
   user, working directory and `privileged` are applied.
 - **Mounts:**
   - bind mounts of files or directories inside the workspace are mounted as
     copies, so writes don't reach your files;
-  - named volumes become cache volumes, one per project and volume;
+  - named volumes become cache volumes, one per project and volume. As with a
+    new Docker volume, an empty one starts as a copy of the image's directory
+    at the mount path when the image has one. The volume belongs to the user
+    the service runs as, so non-root images (Prometheus runs as `nobody`) can
+    write to it;
   - `tmpfs` mounts become temporary directories;
   - file-based secrets and configs are mounted at their targets
     (`/run/secrets/<name>` by default).
@@ -227,7 +239,8 @@ Not reproduced, and not warned about:
   instead;
 - networks and network aliases;
 - restart policies and replicas;
-- seeding a new named volume with the image's content.
+- the exact ownership of a seeded volume: the whole volume belongs to the
+  service's user, where Docker keeps the image directory's ownership.
 
 ```sh
 dagger up -l                                # what dagger up would start

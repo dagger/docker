@@ -115,9 +115,33 @@ type DockerComposeProject {
   """
   The first of names present in this project's directory, or null.
   """
-  let firstPresent(ws: Workspace!, names: [String!]!): String {
-    let present = ws.directory(compose.tool.absolutePath(path), include: names).glob("*")
+  let firstPresent(present: [String!]!, names: [String!]!): String {
     names.filter { name => present.contains(name) }[0]
+  }
+
+  """
+  The Compose and override file names present in this project's directory,
+  from a single listing.
+  """
+  let presentFiles(ws: Workspace!): [String!]! {
+    ws
+      .directory(compose.tool.absolutePath(path), include: compose.configNames + compose.overrideNames)
+      .glob("*")
+  }
+
+  """
+  This project's Compose file and, when there is one, its override file,
+  workspace-root-relative.
+  """
+  let composeFiles(ws: Workspace!): [String!]! {
+    let present = presentFiles(ws)
+    let config = firstPresent(present, compose.configNames)
+    let override = firstPresent(present, compose.overrideNames)
+    if (config == null) {
+      raise "no Compose file in " + path
+    }
+    let empty: [String!]! = []
+    [subpath(config ?? "")] + (if (override == null) { empty } else { [subpath(override ?? "")] })
   }
 
   """
@@ -126,12 +150,7 @@ type DockerComposeProject {
   Compose picks it.
   """
   configPath(ws: Workspace!): String! {
-    let found = firstPresent(ws, compose.configNames)
-    if (found == null) {
-      raise "no Compose file in " + path
-    } else {
-      subpath(found ?? "")
-    }
+    composeFiles(ws)[0] ?? ""
   }
 
   """
@@ -139,8 +158,7 @@ type DockerComposeProject {
   Compose file (compose.override.yml and its variants), or null.
   """
   overridePath(ws: Workspace!): String {
-    let found = firstPresent(ws, compose.overrideNames)
-    if (found == null) { null } else { subpath(found ?? "") }
+    composeFiles(ws)[1]
   }
 
   """
@@ -153,9 +171,7 @@ type DockerComposeProject {
   services(ws: Workspace!): DockerComposeServices! {
     let empty: [String!]! = []
     let names = {
-      let override = overridePath(ws)
-      let files = [configPath(ws)] + (if (override == null) { empty } else { [override ?? ""] })
-      files.reduce(empty) { acc, file =>
+      composeFiles(ws).reduce(empty) { acc, file =>
         acc + parseServiceNames(ws.file(compose.tool.absolutePath(file)).contents)
       }
     } rescue {
@@ -447,8 +463,9 @@ type DockerComposeProject {
 
   """
   The services of specs started in start order, each with every service
-  started before it bound by name, so it can reach them as Compose's default
-  network would. Warnings about what can't be reproduced are printed.
+  started before it bound, so they are up before it starts. Every service
+  has its name as a session-wide hostname. Warnings about what can't be
+  reproduced are printed.
   """
   let started(ws: Workspace!, specs: [ComposeServiceSpec!]!): [ComposeStartedService!]! {
     let empty: [ComposeStartedService!]! = []

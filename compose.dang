@@ -7,7 +7,7 @@ type Compose {
   """
   Image providing the standalone Compose binary at /docker-compose.
   """
-  pub composeImage: String! = "index.docker.io/docker/compose-bin"
+  composeImage: String! = "index.docker.io/docker/compose-bin"
 
   """
   Filenames that mark a Compose project, in the order Compose itself prefers
@@ -26,7 +26,7 @@ type Compose {
   cwd holds no Compose file of its own. Paths are cwd-relative, so a ".."
   prefix marks an enclosing project.
   """
-  pub projects(ws: Workspace!): [ComposeProject!]! {
+  projects(ws: Workspace!): [ComposeProject!]! {
     ws
       .findRoots(markers: configNames)
       .map { projectPath =>
@@ -44,12 +44,12 @@ type Compose {
   declares one, or by building its build context (with any build args) when
   it declares a build instead. Services with neither are skipped.
   """
-  pub startServices(ws: Workspace!): Service! @up {
+  startServices(ws: Workspace!): Service! @up {
     let detected = projects(ws)
     if (detected.length > 1) {
-      raise "multiple Compose projects detected (" +
-        detected.map { project => project.path }.join(", ") +
-        "); enter a project directory to choose one"
+      raise "multiple Compose projects detected ("
+        + detected.map { project => project.path }.join(", ")
+        + "); enter a project directory to choose one"
     }
     let single = detected[0]
     if (single == null) {
@@ -60,7 +60,8 @@ type Compose {
         .filter { spec => (spec.image != "" or spec.buildContext != "") and spec.target != 0 }
         .reduce(proxy) { front, spec =>
           front.withService(
-            service: spec.environment
+            service: spec
+              .environment
               .reduce(
                 if (spec.image != "") {
                   container.from(spec.image)
@@ -89,7 +90,7 @@ type Compose {
   cwd holding no Compose file of its own sits inside its enclosing project, so
   that project is validated too; enter a subproject to validate it alone.
   """
-  pub lint(ws: Workspace!): Void @check {
+  lint(ws: Workspace!): Void @check {
     let layers = projects(ws).map { project, i =>
       directory.withFile(
         toString(i) + "/" + project.configName(ws),
@@ -105,7 +106,6 @@ type Compose {
     layers.sync
     null
   }
-
 }
 
 """
@@ -116,7 +116,7 @@ type ComposeProject {
   Path of this project root, relative to the client's cwd. A ".." prefix
   marks an enclosing project.
   """
-  pub path: String!
+  path: String!
 
   """
   Image providing the standalone Compose binary at /docker-compose.
@@ -146,14 +146,14 @@ type ComposeProject {
   """
   Cwd-relative path of this project's Compose file.
   """
-  pub configPath(ws: Workspace!): String! {
+  configPath(ws: Workspace!): String! {
     subpath(configName(ws))
   }
 
   """
   Name of every service declared by this project's Compose file.
   """
-  pub services(ws: Workspace!): [String!]! {
+  services(ws: Workspace!): [String!]! {
     base(ws)
       .withExec(["/docker-compose", "-f", configName(ws), "config", "--services"])
       .stdout
@@ -177,16 +177,16 @@ type ComposeProject {
       .withExec([
         "sh",
         "-c",
-        "docker-compose -f " + configName(ws) + " config --format json | " +
-          "jq -c '[.services | to_entries[] | {name: .key, " +
-          "image: (.value.image // \"\"), " +
-          "target: (.value.ports[0].target // 0), " +
-          "published: ((.value.ports[0].published // \"0\") | tonumber), " +
-          "buildContext: (.value.build.context // \"\"), " +
-          "buildArgs: ((.value.build.args // {}) | to_entries | " +
-          "map({name: .key, value: (.value // \"\")})), " +
-          "environment: ((.value.environment // {}) | to_entries | " +
-          "map({name: .key, value: (.value // \"\")}))}]'",
+        "docker-compose -f " + configName(ws) + " config --format json | "
+          + "jq -c '[.services | to_entries[] | {name: .key, "
+          + "image: (.value.image // \"\"), "
+          + "target: (.value.ports[0].target // 0), "
+          + "published: ((.value.ports[0].published // \"0\") | tonumber), "
+          + "buildContext: (.value.build.context // \"\"), "
+          + "buildArgs: ((.value.build.args // {}) | to_entries | "
+          + "map({name: .key, value: (.value // \"\")})), "
+          + "environment: ((.value.environment // {}) | to_entries | "
+          + "map({name: .key, value: (.value // \"\")}))}]'",
       ])
       .stdout
     fromJSON(specs)
@@ -216,7 +216,7 @@ type ComposeProject {
   """
   Validate this project's Compose file with 'docker compose config'.
   """
-  pub lint(ws: Workspace!): Void @check {
+  lint(ws: Workspace!): Void @check {
     lintExec(ws).sync
     null
   }
@@ -239,7 +239,6 @@ type ComposeProject {
       .withWorkdir("/src")
       .withDirectory(".", ws.directory(path))
   }
-
 }
 
 """
@@ -249,39 +248,39 @@ type ComposeService {
   """
   Service name.
   """
-  pub name: String!
+  name: String!
 
   """
   Image the service runs. Empty when the service declares a build instead.
   """
-  pub image: String! = ""
+  image: String! = ""
 
   """
   Container port of the service's first port mapping, 0 when it declares none.
   """
-  pub target: Int! = 0
+  target: Int! = 0
 
   """
   Published port of the service's first port mapping, 0 when none is
   published.
   """
-  pub published: Int! = 0
+  published: Int! = 0
 
   """
   Build context as resolved by 'docker compose config'. Empty when the
   service runs an image.
   """
-  pub buildContext: String! = ""
+  buildContext: String! = ""
 
   """
   Args of the service's build configuration.
   """
-  pub buildArgs: [ComposeBuildArg!]! = []
+  buildArgs: [ComposeBuildArg!]! = []
 
   """
   Environment variables declared by the service.
   """
-  pub environment: [ComposeEnvVariable!]! = []
+  environment: [ComposeEnvVariable!]! = []
 }
 
 """
@@ -291,12 +290,12 @@ type ComposeEnvVariable {
   """
   Variable name.
   """
-  pub name: String!
+  name: String!
 
   """
   Variable value.
   """
-  pub value: String! = ""
+  value: String! = ""
 }
 
 """
@@ -306,10 +305,10 @@ type ComposeBuildArg {
   """
   Arg name.
   """
-  pub name: String!
+  name: String!
 
   """
   Arg value.
   """
-  pub value: String! = ""
+  value: String! = ""
 }

@@ -8,7 +8,7 @@ type Docker {
   """
   Image used for Dockerfile linting.
   """
-  pub lintImage: String! = "docker.io/hadolint/hadolint:v2.14.0-alpine"
+  lintImage: String! = "docker.io/hadolint/hadolint:v2.14.0-alpine"
 
   """
   Container that Compose services are attached to by injectServices.
@@ -18,7 +18,7 @@ type Docker {
 
   to run the services alongside a container of your choosing.
   """
-  pub composeBase: Container! = container
+  composeBase: Container! = container
 
   """
   Environment variables added to the compose container by injectServices, as
@@ -29,7 +29,7 @@ type Docker {
   Only the first "=" separates the name from the value, so values may contain
   "=". An entry with no "=" sets an empty value.
   """
-  pub composeEnvs: [String!]! = []
+  composeEnvs: [String!]! = []
 
   """
   The Docker projects visible from the client's cwd: every directory at or
@@ -37,7 +37,7 @@ type Docker {
   cwd holds no Dockerfile of its own. Paths are cwd-relative, so a ".." prefix
   marks an enclosing project.
   """
-  pub projects(ws: Workspace!): [DockerProject!]! {
+  projects(ws: Workspace!): [DockerProject!]! {
     ws
       .findRoots(markers: ["Dockerfile"])
       .map { projectPath =>
@@ -51,7 +51,7 @@ type Docker {
   By default, path may be a project root or a directory inside a project. Set
   findUp to false when path is already a project root and no lookup is needed.
   """
-  pub project(ws: Workspace!, path: String!, findUp: Boolean! = true): DockerProject! {
+  project(ws: Workspace!, path: String!, findUp: Boolean! = true): DockerProject! {
     DockerProject(
       path: if (findUp) {
         let foundDockerfilePath = ws.findUp("Dockerfile", path)
@@ -80,8 +80,8 @@ type Docker {
     let common = cwdSegments.map { segment, i => i }.reduce(0) { acc, i =>
       if (acc == i and dirSegments[i] == cwdSegments[i]) { acc + 1 } else { acc }
     }
-    let segments = cwdSegments.dropFirst(common).map { segment => ".." } +
-      dirSegments.dropFirst(common)
+    let segments = cwdSegments.dropFirst(common).map { segment => ".." }
+      + dirSegments.dropFirst(common)
     if (segments.length == 0) { "." } else { segments.join("/") }
   }
 
@@ -90,7 +90,7 @@ type Docker {
   holding no Dockerfile of its own sits inside its enclosing project, so that
   project is linted too; enter a subproject to lint it alone.
   """
-  pub lintAll(ws: Workspace!): Void @check {
+  lintAll(ws: Workspace!): Void @check {
     let layers = projects(ws).map { project, i =>
       directory.withFile(toString(i) + "/Dockerfile", project.lintExec(ws).file("Dockerfile"))
     }.reduce(directory) { merged, layer => merged.withDirectory(".", layer) }
@@ -107,7 +107,7 @@ type Docker {
   """
   Build every project visible from the client's cwd.
   """
-  pub buildAll(ws: Workspace!): Void @check {
+  buildAll(ws: Workspace!): Void @check {
     let layers = projects(ws).map { project, i =>
       directory.withDirectory(toString(i), project.build(ws).rootfs)
     }.reduce(directory) { merged, layer => merged.withDirectory(".", layer) }
@@ -127,7 +127,7 @@ type Docker {
   this check covers the stages a default build never reaches, such as test
   or lint stages.
   """
-  pub buildUnrefStages(ws: Workspace!): Void @check {
+  buildUnrefStages(ws: Workspace!): Void @check {
     let layers = projects(ws).map { project, i =>
       project
         .stages(ws)
@@ -148,11 +148,10 @@ type Docker {
     null
   }
 
-
   """
   Spawn an ephemeral Docker Engine in a container.
   """
-  pub engine(
+  engine(
     """
     Docker Engine version.
     """
@@ -192,8 +191,8 @@ type Docker {
   """
   Tools for validating Docker Compose projects.
   """
-  pub compose: Compose! {
-    Compose()
+  compose: Compose! {
+    Compose
   }
 
   """
@@ -212,12 +211,12 @@ type Docker {
   it in dagger.toml via settings.composeBase. Any composeEnvs entries are set
   on it as environment variables.
   """
-  pub injectServices(ws: Workspace!): Container! {
+  injectServices(ws: Workspace!): Container! {
     let detected = compose.projects(ws)
     if (detected.length > 1) {
-      raise "multiple Compose projects detected (" +
-        detected.map { project => project.path }.join(", ") +
-        "); enter a project directory to choose one"
+      raise "multiple Compose projects detected ("
+        + detected.map { project => project.path }.join(", ")
+        + "); enter a project directory to choose one"
     }
     let single = detected[0]
     if (single == null) {
@@ -227,7 +226,8 @@ type Docker {
         .serviceSpecs(ws)
         .filter { spec => spec.image != "" or spec.buildContext != "" }
         .reduce(composeBaseWithEnvs) { ctr, spec =>
-          let built = spec.environment
+          let built = spec
+            .environment
             .reduce(
               if (spec.image != "") {
                 container.from(spec.image)
@@ -270,7 +270,7 @@ type Docker {
   """
   A Docker CLI ready to query this engine.
   """
-  pub cli(
+  cli(
     """
     Version of the Docker CLI to run.
     """
@@ -282,7 +282,6 @@ type Docker {
   ): CLI! {
     CLI(engine: engine ?? self.engine(version: version))
   }
-
 }
 
 """
@@ -292,13 +291,14 @@ type CLI {
   """
   The Docker Engine this client is wired to.
   """
-  pub engine: Service!
+  engine: Service!
 
   """
   Package the Docker CLI into a container, wired to an engine.
   """
-  pub container: Container! {
-    Dagger.container
+  container: Container! {
+    Dagger
+      .container
       .from("index.docker.io/docker:cli")
       .withoutEntrypoint
       .withServiceBinding("dockerd", engine)
@@ -308,7 +308,7 @@ type CLI {
   """
   Execute 'docker pull'.
   """
-  pub pull(
+  pull(
     """
     The docker repository to pull from. Example: registry.dagger.io/engine
     """
@@ -324,7 +324,7 @@ type CLI {
   """
   Execute 'docker push'.
   """
-  pub push(
+  push(
     """
     The docker repository to push to.
     """
@@ -340,7 +340,7 @@ type CLI {
   """
   Execute 'docker pull' and return the CLI state, for chaining.
   """
-  pub withPull(repository: String!, tag: String! = "latest"): CLI! {
+  withPull(repository: String!, tag: String! = "latest"): CLI! {
     pull(repository, tag)
     self
   }
@@ -348,7 +348,7 @@ type CLI {
   """
   Execute 'docker push' and return the CLI state, for chaining.
   """
-  pub withPush(repository: String!, tag: String! = "latest"): CLI! {
+  withPush(repository: String!, tag: String! = "latest"): CLI! {
     push(repository, tag)
     self
   }
@@ -356,13 +356,14 @@ type CLI {
   """
   Load a container into the Docker Engine cache (docker load).
   """
-  pub load(
+  load(
     """
     The container to load.
     """
     ctr: Container!,
   ): Image! {
-    let out = self.container
+    let out = self
+      .container
       .withMountedFile("/import.tar", ctr.asTarball)
       .withExec(["docker", "load", "-q", "-i", "/import.tar"])
       .stdout
@@ -383,7 +384,7 @@ type CLI {
   Look up an image in the local Docker Engine cache.
   If exactly one image matches the filters, return it. Otherwise, raise an error.
   """
-  pub image(
+  image(
     """
     Filter by image repository.
     """
@@ -413,7 +414,7 @@ type CLI {
   """
   List images in the local Docker Engine cache.
   """
-  pub images(
+  images(
     """
     Filter by image repository.
     """
@@ -427,7 +428,8 @@ type CLI {
     """
     localID: String! = "",
   ): [Image!]! {
-    self.container
+    self
+      .container
       .withExec(["docker", "image", "list", "-a", "--no-trunc", "--format", "{{json .}}"])
       .stdout
       .split("\n")
@@ -436,9 +438,9 @@ type CLI {
         fromJSON(line) :: {{ID: String!, Repository: String!, Tag: String!}}!
       }
       .filter { info =>
-        (repository == "" or repository == info.Repository) and
-        (tag == "" or tag == info.Tag) and
-        (localID == "" or info.ID.hasPrefix(localID))
+        (repository == "" or repository == info.Repository)
+          and (tag == "" or tag == info.Tag)
+          and (localID == "" or info.ID.hasPrefix(localID))
       }
       .map { info =>
         Image(client: self, localID: info.ID, repository: info.Repository, tag: info.Tag)
@@ -448,7 +450,7 @@ type CLI {
   """
   Run a container with the docker CLI.
   """
-  pub run(
+  run(
     """
     Name of the image to run. Example: registry.dagger.io/engine
     """
@@ -464,7 +466,6 @@ type CLI {
   ): String! {
     self.container.withExec(["docker", "run", name + ":" + tag] + args).stdout
   }
-
 }
 
 """
@@ -476,45 +477,44 @@ type Image {
   """
   The local identifier of the docker image.
   """
-  pub localID: String!
+  localID: String!
 
   """
   The image repository.
   """
-  pub repository: String! = ""
+  repository: String! = ""
 
   """
   The image tag.
   """
-  pub tag: String! = ""
+  tag: String! = ""
 
   """
   Export this image from the docker engine into Dagger.
   """
-  pub export: Container! {
-    let archive = client.container
+  export: Container! {
+    let archive = client
+      .container
       .withExec(["docker", "image", "save", "-o", "/export.tar", localID])
       .file("/export.tar")
     Dagger.container.import(archive)
   }
 
-
   """
   Push this image to a registry.
   """
-  pub push: String! {
+  push: String! {
     export.publish(ref)
   }
 
   """
   Return the image's ref (remote address).
   """
-  pub ref: String! {
+  ref: String! {
     let refTag = if (tag == "") { "latest" } else { tag }
     let address = repository + ":" + refTag
     if (localID == "") { address } else { address + "@" + localID }
   }
-
 }
 
 """
@@ -525,7 +525,7 @@ type DockerProject {
   Path of this project root, relative to the client's cwd. A ".." prefix
   marks an enclosing project.
   """
-  pub path: String!
+  path: String!
 
   """
   Image used for Dockerfile linting.
@@ -546,21 +546,21 @@ type DockerProject {
   """
   Cwd-relative path of this project's Dockerfile.
   """
-  pub dockerfilePath: String! {
+  dockerfilePath: String! {
     subpath("Dockerfile")
   }
 
   """
   Build context mounted for this project's Docker commands.
   """
-  pub buildContext(ws: Workspace!): Directory! {
+  buildContext(ws: Workspace!): Directory! {
     ws.directory(path)
   }
 
   """
   Build the container from this project's Dockerfile.
   """
-  pub build(
+  build(
     ws: Workspace!,
     """
     Target build stage to build.
@@ -586,14 +586,14 @@ type DockerProject {
   line-based: a FROM inside a heredoc or after a line continuation is not
   distinguished from a real instruction.
   """
-  pub stages(ws: Workspace!): [DockerfileStage!]! {
+  stages(ws: Workspace!): [DockerfileStage!]! {
     let contents = ws.file(dockerfilePath).contents
     let fromMatches = contents.matchAll("(?im)^\\s*FROM\\s+(?:--\\S+\\s+)*(\\S+)(?:\\s+AS\\s+(\\S+))?")
     # Stage references, lowercased since stage names are case-insensitive:
     # FROM bases, COPY/ADD --from=<ref>, and RUN --mount=...,from=<ref>.
-    let references = fromMatches.map { m => (m.captures[0] ?? "").toLower } +
-      contents.matchAll("(?i)--from=(\\S+)").map { m => (m.captures[0] ?? "").toLower } +
-      contents.matchAll("(?i)[=,]from=([^,\\s]+)").map { m => (m.captures[0] ?? "").toLower }
+    let references = fromMatches.map { m => (m.captures[0] ?? "").toLower }
+      + contents.matchAll("(?i)--from=(\\S+)").map { m => (m.captures[0] ?? "").toLower }
+      + contents.matchAll("(?i)[=,]from=([^,\\s]+)").map { m => (m.captures[0] ?? "").toLower }
     fromMatches.map { m, i =>
       let stageName = m.captures[1]
       let name = if (stageName == "" or stageName == null) { null } else { stageName }
@@ -602,8 +602,8 @@ type DockerProject {
         index: i,
         base: m.captures[0] ?? "",
         name: name,
-        referenced: references.contains((name ?? "").toLower) or
-          references.contains(toString(i)),
+        referenced: references.contains((name ?? "").toLower)
+          or references.contains(toString(i)),
       )
     }
   }
@@ -611,7 +611,7 @@ type DockerProject {
   """
   Return the named build stage of this project's Dockerfile.
   """
-  pub stage(ws: Workspace!, name: String!): DockerfileStage! {
+  stage(ws: Workspace!, name: String!): DockerfileStage! {
     let found = stages(ws).filter { candidate => candidate.name == name }[0]
     if (found == null) {
       raise "no stage named \"" + name + "\" in " + dockerfilePath
@@ -623,7 +623,7 @@ type DockerProject {
   """
   Lint this project's Dockerfile.
   """
-  pub lint(ws: Workspace!): Void @check {
+  lint(ws: Workspace!): Void @check {
     lintExec(ws).sync
     null
   }
@@ -638,7 +638,6 @@ type DockerProject {
       .withDirectory(".", ws.directory(path, include: ["Dockerfile"]))
       .withExec(["hadolint", "Dockerfile"])
   }
-
 }
 
 """
@@ -648,34 +647,34 @@ type DockerfileStage {
   """
   The Docker project whose Dockerfile declares this stage.
   """
-  pub project: DockerProject!
+  project: DockerProject!
 
   """
   Zero-based position of this stage in the Dockerfile.
   """
-  pub index: Int!
+  index: Int!
 
   """
   Image or prior stage this stage builds from.
   """
-  pub base: String!
+  base: String!
 
   """
   Stage name declared with AS. Null for unnamed stages.
   """
-  pub name: String
+  name: String
 
   """
   Whether another stage in the Dockerfile references this stage, as a FROM
   base, a COPY/ADD --from source, or a RUN --mount from source. References by
   name (case-insensitive) and by stage index are both counted.
   """
-  pub referenced: Boolean!
+  referenced: Boolean!
 
   """
   Build this stage of the project's Dockerfile.
   """
-  pub build(
+  build(
     ws: Workspace!,
     """
     Platform to build for, e.g. "linux/amd64". Defaults to the host platform.
@@ -684,11 +683,10 @@ type DockerfileStage {
   ): Container! {
     let target = name
     if (target == null) {
-      raise "cannot build stage " + toString(index) + " of " + project.dockerfilePath +
-        " by target: it has no name"
+      raise "cannot build stage " + toString(index) + " of " + project.dockerfilePath
+        + " by target: it has no name"
     } else {
       project.build(ws, target: target, platform: platform)
     }
   }
-
 }

@@ -1,7 +1,7 @@
 # docker
 
 A [Dagger](https://dagger.io) module, written in Dang, for Dockerfile and
-Docker Compose projects: it lints Dockerfiles with
+Docker Compose projects. It lints Dockerfiles with
 [hadolint](https://github.com/hadolint/hadolint), builds them, validates
 Compose files, builds and runs Compose services, and wraps a Docker engine
 and CLI.
@@ -18,64 +18,76 @@ dagger install github.com/dagger/docker
 
 ## What it finds
 
-The module works on four kinds of things, each a collection you can select
-from by key:
+The module works on four collections. You can select from each by key:
 
-| Collection                                     | Key                              | Flag                             |
-| ---------------------------------------------- | -------------------------------- | -------------------------------- |
-| Docker projects (`projects`)                   | directory holding a `Dockerfile` | `--docker-project=PATH`          |
-| Dockerfile stages (`projects/stages`)          | stage name                       | `--docker-dockerfile-stage=NAME` |
-| Compose projects (`compose/projects`)          | directory holding a Compose file | `--docker-compose-project=PATH`  |
-| Compose services (`compose/projects/services`) | service name                     | `--docker-compose-service=NAME`  |
+| Collection                                     | Key                              | Flag                            |
+| ---------------------------------------------- | -------------------------------- | ------------------------------- |
+| Docker projects (`projects`)                   | directory holding a `Dockerfile` | `--docker-project=PATH`         |
+| Dockerfile stages (`projects/stages`)          | stage name                       | `--docker-stage=NAME`           |
+| Compose projects (`compose/projects`)          | directory holding a Compose file | `--docker-compose-project=PATH` |
+| Compose services (`compose/projects/services`) | service name                     | `--docker-compose-service=NAME` |
 
-Paths are relative to the workspace root (`.` for the root). A Compose file
-is `compose.yaml`, `compose.yml`, `docker-compose.yaml` or
-`docker-compose.yml`; when a directory holds several, the first in that order
-is used, as Compose does.
-
-List them:
+Paths are relative to the workspace root (`.` for the root). List them:
 
 ```sh
 dagger list docker-projects -a
-dagger list docker-dockerfile-stages -a
+dagger list docker-stages -a
 dagger list docker-compose-projects -a
 dagger list docker-compose-services -a
 ```
 
-Listing never starts a container: projects come from file names, stages from
-the Dockerfile's text, and services from the Compose file's text.
+Listing never starts a container. Projects come from file names, stages from
+the Dockerfile's text, and services from the Compose files' text.
 
 ### Stages
 
-The stages collection holds only the named stages a default build never
-reaches: stages that no other stage references (as a `FROM` base, a
-`COPY`/`ADD --from` source or a `RUN --mount` `from=` source, by name or by
-index) and that are not the final stage. Those are typically `test` or
-`lint` stages; the project's own build covers the rest. Unnamed stages can't
-be targeted, so they are never keys.
+The stages collection holds only the named stages that the project build
+never reaches. A stage is in it when:
+
+- no other stage references it, by name or by index: not as a `FROM` base,
+  not as a `COPY`/`ADD --from` source and not as a `RUN --mount` `from=`
+  source;
+- it is not the final stage;
+- it is not the `buildTarget` setting.
+
+Those are typically `test` or `lint` stages; the project build covers the
+rest. Unnamed stages can't be targeted, so they are never keys.
 
 `allStages` lists every stage with its `index`, `name`, `base` and
 `referenced` flag, and `stage(name:)` returns any one of them.
 
-Stages are read line by line from `FROM` instructions: a `FROM` inside a
-heredoc or after a line continuation is not told apart from a real one.
+Stages are read line by line from `FROM` instructions, so a `FROM` inside a
+heredoc or after a line continuation looks like a real one. A leading UTF-8
+byte order mark is ignored.
 
-### Services
+### Compose files
 
-Service names are read from the Compose file's top-level `services` mapping
-without running Compose. Block mappings at any indentation, flow mappings
-(`services: {web: {...}}`), quoted keys and comments are understood. Not
-seen:
+A Compose project's file is `compose.yaml`, `compose.yml`,
+`docker-compose.yml` or `docker-compose.yaml`; when a directory holds several,
+the first in that order wins, as in Compose. Compose also merges an override
+file over it: the first of `compose.override.yml`, `compose.override.yaml`,
+`docker-compose.override.yml` and `docker-compose.override.yaml`. The checks
+and runners call `docker compose` in the project directory without `-f`, so
+Compose picks and merges the files itself (including `COMPOSE_FILE` from a
+`.env` file).
 
-- services pulled in with `include:` or from other Compose files (override
-  files, `-f`);
+Service names are read from the top-level `services` mapping of the Compose
+file and its override file, without running Compose. The parser understands:
+
+- block mappings at any indentation
+- flow mappings (`services: {web: {...}}`)
+- quoted keys, comments and a leading byte order mark
+
+It does not see:
+
+- services pulled in with `include:`, or from files named by `-f` or
+  `COMPOSE_FILE`;
 - services merged in with YAML anchors and merge keys (`<<: *base`) at the
   `services` level, or a `services:` mapping given as an alias;
 - environment interpolation in service names.
 
-A file the module can't read this way lists no services (it never fails the
-listing). The checks and runners then use `docker compose config`, so they
-see the file as Compose resolves it.
+A file the module can't read this way lists no services, and never fails the
+listing.
 
 ## Working directory
 
@@ -94,36 +106,49 @@ cd app/src && dagger check --docker    # checks the app project and its stages
 
 ## Checks
 
-| Address                                  | Runs                                           |
-| ---------------------------------------- | ---------------------------------------------- |
-| `docker/projects/lint`                   | hadolint on the project's `Dockerfile`         |
-| `docker/projects/build`                  | a build of the `Dockerfile`'s final stage      |
-| `docker/projects/stages/build`           | a build of each stage in the stages collection |
-| `docker/compose/projects/lint`           | `docker compose config --quiet`                |
-| `docker/compose/projects/services/build` | a build of each service that declares `build`  |
+| Address                                          | Check name      | Runs                                           |
+| ------------------------------------------------ | --------------- | ---------------------------------------------- |
+| `docker/projects/lint`                           | `lint`          | hadolint on the project's `Dockerfile`         |
+| `docker/projects/build`                          | `build`         | a build of the project's `Dockerfile`          |
+| `docker/projects/stages/build-stage`             | `build-stage`   | a build of each stage in the stages collection |
+| `docker/compose/projects/lint`                   | `lint`          | `docker compose config --quiet`                |
+| `docker/compose/projects/services/build-service` | `build-service` | a build of each service that declares `build`  |
 
-A service that runs an image has nothing to build, so its build check
-passes. Services behind a profile are built too.
+- The project `build` builds the final stage. When the `buildTarget` setting
+  names a stage the Dockerfile declares, it builds that stage instead.
+- A service's build uses its build args, target and Dockerfile from the
+  resolved Compose configuration. Its context may be anywhere in the
+  workspace (`context: ../shared`); a context outside the workspace fails the
+  check.
+- A service that runs an image has nothing to build, so its check passes.
+  Services behind a profile are built too.
 
 ```sh
-dagger check                                        # every check in the workspace
-dagger check --docker                               # every check from this module
-dagger check --docker-project=app                   # one project: lint, build and its stages
-dagger check --docker-projects --check lint         # hadolint on every project
-dagger check --check build                          # every build check, in every module
-dagger check docker/projects/stages/build --docker-dockerfile-stage=test
-dagger check --docker-compose-service=api           # build one Compose service
-dagger check -l --all --docker                      # list one line per check
-dagger check -l --all --docker -f=cli               # ...as flags you can paste back
+dagger check                                  # every check in the workspace
+dagger check --docker                         # every check from this module
+dagger check --docker-project=app             # one project: lint, build and its stages
+dagger check --docker-projects --check lint   # hadolint on every project
+dagger check --check build-stage              # every stage build
+dagger check --docker-project=app --docker-stage=test
+dagger check --docker-compose-service=api     # build one Compose service
+dagger check -l --all --docker                # list one line per check
+dagger check -l --all --docker -f=cli         # ...as flags you can paste back
 ```
 
-The selected items run in parallel, and every failure is reported with the
-project, stage or service and the step that failed, for example:
+`--docker-stage=NAME` and `--docker-compose-service=NAME` match that name in
+every project. In a repository where many Dockerfiles declare a `dev-envs`
+stage, `--docker-stage=dev-envs` selects all of them. Add `--docker-project`
+or `--docker-compose-project` to narrow it down.
+
+The selected items run in parallel. Every failure is reported with the
+project, stage or service and the step that failed. The engine's internal
+object IDs are stripped from build errors. The failing Dockerfile step's own
+output is in the trace, not in the message:
 
 ```
 docker build failed in 1 of 2 projects:
-- broken: docker build failed:
-failed to clone built container state: exit code: 3
+- broken: docker build failed: failed to clone built container state: exit code: 3
+(the failing step's output is in the trace)
 ```
 
 Run checks with `dagger check`, in CI especially: `dagger call` on a check
@@ -131,44 +156,95 @@ function does not fail the command when the check fails.
 
 The flags for this module (see `dagger check --help`):
 
-| Flag                                | Selects                                |
-| ----------------------------------- | -------------------------------------- |
-| `--docker`, `--by-docker`           | checks from this module                |
-| `--docker-project=PATH`             | one Docker project (repeatable)        |
-| `--docker-projects`                 | every Docker project                   |
-| `--docker-dockerfile-stage=NAME`    | one stage (repeatable)                 |
-| `--docker-stages`                   | every stage                            |
-| `--docker-compose-project=PATH`     | one Compose project (repeatable)       |
-| `--docker-compose-projects`         | every Compose project                  |
-| `--docker-compose-service=NAME`     | one Compose service (repeatable)       |
-| `--docker-services`                 | every Compose service                  |
-| `--check NAME`                      | checks with that name, in every module |
+| Flag                            | Selects                                  |
+| ------------------------------- | ---------------------------------------- |
+| `--docker`, `--by-docker`       | checks from this module                  |
+| `--docker-project=PATH`         | one Docker project (repeatable)          |
+| `--docker-projects`             | every Docker project                     |
+| `--docker-stage=NAME`           | stages with that name (repeatable)       |
+| `--docker-stages`               | every stage                              |
+| `--docker-compose-project=PATH` | one Compose project (repeatable)         |
+| `--docker-compose-projects`     | every Compose project                    |
+| `--docker-compose-service=NAME` | services with that name (repeatable)     |
+| `--docker-services`             | every Compose service                    |
+| `--check NAME`                  | checks with that name, in every module   |
 
 The flag names can change when another installed module has an item type
 with the same name; `dagger check --help` lists the flags in effect.
 
+### hadolint
+
+hadolint runs with `--no-color`. It reads the nearest `.hadolint.yaml` or
+`.hadolint.yml` from the project's directory up to the workspace root. Extra
+arguments come from the `lintArgs` setting, for example
+`["--failure-threshold", "warning"]`.
+
 ## Running Compose services
 
-`up` on a project's services runs the services that declare a port, behind
-one [proxy](https://github.com/dagger/proxy) with a frontend port per service
-(its published port, or its target port when none is published). Each
-service runs its image, or the image its build context builds with its build
-args, target and Dockerfile, with its entrypoint, command and environment.
-Services behind a profile are not started.
+`up` on a project's services runs the selected services the way
+`docker compose up` would, as far as Dagger can:
+
+- **Dependencies:** the selected services and every service they
+  `depends_on` are started.
+- **Networking:** each service can reach, by service name, every service that
+  starts before it. Services start in `depends_on` order. Among services
+  ready to start, image-only services come first, then by name. Declare
+  `depends_on` when one service must reach another; Dagger service bindings
+  can't form cycles.
+- **Ports:** every published TCP port of every started service is published
+  through one [proxy](https://github.com/dagger/proxy) service, as raw TCP.
+  A port without a published port is published on its target port. Ports
+  from `ports` and `expose` are what Dagger waits for before starting
+  dependents.
+- **Container:** each service runs its image, or the image its build context
+  builds. Compose's entrypoint, command, environment (including `env_file`),
+  user, working directory and `privileged` are applied.
+- **Mounts:**
+  - bind mounts of files or directories inside the workspace are mounted as
+    copies, so writes don't reach your files;
+  - named volumes become cache volumes, one per project and volume;
+  - `tmpfs` mounts become temporary directories;
+  - file-based secrets and configs are mounted at their targets
+    (`/run/secrets/<name>` by default).
+- **Profiles:** services behind a profile are not started.
+
+What it can't reproduce is printed as a warning in the trace, per service,
+for example `warning: app (service web): cap_add is ignored`. The same list
+is available as `warnings` on a service:
+
+- UDP ports and `expose` entries that aren't single TCP ports;
+- bind mounts outside the workspace (such as `/var/run/docker.sock`) and
+  missing bind sources;
+- secrets and configs from the environment or external;
+- other mount types;
+- `cap_add`, `cap_drop`, `devices`, `dns`, `deploy`, `extra_hosts`, `init`,
+  `ipc`, `network_mode`, `pid`, `platform`, `runtime`, `security_opt`,
+  `shm_size`, `stop_signal`, `sysctls`, `tmpfs` and `ulimits`.
+
+Not reproduced, and not warned about:
+
+- healthchecks and `depends_on` conditions: Dagger waits for exposed ports
+  instead;
+- networks and network aliases;
+- restart policies and replicas;
+- seeding a new named volume with the image's content.
 
 ```sh
-dagger up -l                                        # what dagger up would start
-dagger up --docker-compose-project=svc              # the services of one project
+dagger up -l                                # what dagger up would start
+dagger up --docker-compose-project=svc      # the services of one project
 ```
 
-`dagger up` starts every service in the workspace, including this module's
-`engine` functions (Docker-in-Docker), so select the Compose project.
+A bare `dagger up` starts every service in the workspace, including this
+module's `engine` functions (Docker-in-Docker), so select the Compose
+project.
 
-`injectServices` returns the `composeBase` container with every service of
-the Compose project in your working directory bound to it by service name,
-and `composeEnvs` set as environment variables. Exactly one Compose project
-must be visible. `composeBase` is an empty container by default, so set it
-to an image you can run commands in:
+`injectServices` returns the `composeBase` container with services bound to
+it by name, and `composeEnvs` set as environment variables. On the services
+collection, it binds the selected services and their dependencies. The
+top-level `injectServices` binds every service of the one Compose project in
+your working directory; exactly one project must be visible. The services
+are started as for `up`. `composeBase` is an empty container by default, so
+set it to an image you can run commands in:
 
 ```sh
 dagger settings docker composeBase alpine:3.20
@@ -189,12 +265,13 @@ let projects = docker.projects(ws)
 projects.keys                                        # ["app", "svc/api"]
 run(projects.batch.lint(ws))                         # lint every project
 run(projects.subset(keys: ["app"]).batch.build(ws))  # build one
-run(projects.get(key: "app").stages(ws).batch.build(ws))
+run(projects.get(key: "app").stages(ws).batch.buildStage(ws))
 projects.get(key: "app").container(ws, target: "test")  # the built image
 
 let services = docker.compose.projects(ws).get(key: "svc").services(ws)
 services.subset(keys: ["web", "db"]).batch.up(ws)    # a Service
 services.subset(keys: ["db"]).batch.injectServices(ws)  # a Container
+services.get(key: "web").warnings(ws)                # what up can't reproduce
 ```
 
 A check called through a dependency returns a `Check` that has not run yet.
@@ -235,6 +312,9 @@ Set these in your workspace `dagger.toml`:
 [modules.docker]
 source = "github.com/dagger/docker"
 settings.lintImage = "docker.io/hadolint/hadolint:v2.14.0-alpine"  # the default
+settings.lintArgs = ["--failure-threshold", "warning"]  # default: []; extra hadolint arguments
+settings.buildTarget = "production"            # default: ""; stage the project build builds where declared
+settings.composeImage = "docker.io/docker/compose-bin:v5.5.0"  # the default; provides /docker-compose
 settings.composeBase = "alpine:3.20"           # default: an empty container; what injectServices binds services to
 settings.composeEnvs = ["LOG_LEVEL=debug"]     # default: []; KEY=VALUE set on composeBase
 ```
@@ -242,10 +322,14 @@ settings.composeEnvs = ["LOG_LEVEL=debug"]     # default: []; KEY=VALUE set on c
 Or from the CLI:
 
 ```sh
-dagger settings docker composeBase alpine:3.20    # set
-dagger settings -u docker composeBase             # unset, back to the default
-dagger settings docker                            # show
+dagger settings docker buildTarget production    # set
+dagger settings -u docker buildTarget            # unset, back to the default
+dagger settings docker                           # show
 ```
+
+`buildTarget` is useful when Dockerfiles end in a development stage, such as
+the `dev-envs` stage some repositories add last. A Dockerfile that doesn't
+declare the stage still builds its final stage.
 
 In `composeEnvs`, only the first `=` separates the name from the value, and
 an entry without `=` sets an empty value.

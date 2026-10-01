@@ -188,15 +188,18 @@ arguments come from the `lintArgs` setting, for example
 
 - **Dependencies:** the selected services and every service they
   `depends_on` are started.
-- **Networking:** each service can reach, by service name, only the services
-  that start before it. Dagger service bindings can't form cycles, so
-  Compose's network, where every service reaches every other, can't be
-  reproduced. Services start in `depends_on` order; among services ready to
-  start, image-only services come first, then by name. A service that starts
-  earlier can't reach one that starts later. In prometheus-grafana, for
-  example, `grafana` starts before `prometheus` (by name), so grafana can't
-  reach prometheus unless it declares `depends_on: [prometheus]`. Declare
-  `depends_on` whenever one service must reach another.
+- **Networking:** each service's name is its hostname for the whole Dagger
+  session, so once a service is running, any other service can reach it by
+  name, as on Compose's default network. What differs is start order and
+  waiting. Each service is bound to the services that start before it, so it
+  starts only after they are up: Dagger waits until their exposed ports
+  accept connections. Services start in `depends_on` order; among services
+  ready to start, image-only services come first, then by name. A service
+  isn't held back for one that starts after it. In prometheus-grafana, for
+  example, `grafana` starts before `prometheus` (by name), so its queries
+  fail until prometheus is up and then succeed. Declare `depends_on` when a
+  service needs another to be up when it starts. Dagger service bindings
+  can't form cycles, so a `depends_on` cycle is broken in the same order.
 - **Ports:** every published TCP port of every started service is published
   through one [proxy](https://github.com/dagger/proxy) service, as raw TCP,
   including the same target port on several published ports. A port without

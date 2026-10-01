@@ -195,8 +195,8 @@ type E2e {
     assert(same(referenced, ["base", "deps", "builder"]), "referenced stages: " + referenced.join(", "))
     assert(app.stage(tree, "builder").referenced, "stage() did not find builder")
 
-    run(stages.batch.build(tree))
-    run(stages.get(key: "lint").build(tree))
+    run(stages.batch.buildStage(tree))
+    run(stages.get(key: "lint").buildStage(tree))
 
     # A project without unreachable named stages has no stage keys, and an
     # unreadable Dockerfile lists none rather than failing the listing.
@@ -228,12 +228,12 @@ type E2e {
       .asWorkspace
     let stages = docker.projects(ws).get(key: ".").stages(ws)
     assert(same(stages.keys, ["broken", "fine"]), "stage keys: " + stages.keys.join(", "))
-    let batch = failure(stages.batch.build(ws))
+    let batch = failure(stages.batch.buildStage(ws))
     assert(
       batch.contains("docker build failed in 1 of 2 stages") and batch.contains("- . (stage broken): docker build failed"),
       "the stage batch did not name the failing stage: " + batch,
     )
-    run(stages.subset(keys: ["fine"]).batch.build(ws))
+    run(stages.subset(keys: ["fine"]).batch.buildStage(ws))
     run(docker.projects(ws).batch.build(ws))
     null
   }
@@ -391,9 +391,9 @@ type E2e {
     let services = docker.compose.projects(ws).get(key: ".").services(ws)
     assert(same(services.keys, ["api", "bad", "debug", "web"]), "service keys: " + services.keys.join(", "))
     # A service behind a profile is built too.
-    run(services.subset(keys: ["api", "debug", "web"]).batch.build(ws))
-    run(services.get(key: "web").build(ws))
-    let batch = failure(services.batch.build(ws))
+    run(services.subset(keys: ["api", "debug", "web"]).batch.buildService(ws))
+    run(services.get(key: "web").buildService(ws))
+    let batch = failure(services.batch.buildService(ws))
     assert(
       batch.contains("docker build failed in 1 of 4 services")
         and batch.contains("- . (service bad): docker build failed"),
@@ -501,7 +501,247 @@ type E2e {
     } rescue {
       err: Error => err.message
     }
-    assert(portless.contains("no selected service declares a port"), "a portless selection: " + portless)
+    assert(portless.contains("no selected service publishes a TCP port"), "a portless selection: " + portless)
+    null
+  }
+
+  """
+  A Compose project in the style of nginx-golang: web publishes two ports,
+  reads its config and site from bind mounts and a secret from a file, and
+  reaches api, which publishes nothing and is started as its dependency.
+  """
+  let stack: Workspace! {
+    directory
+      .withNewFile(
+        "stack/compose.yaml",
+        lines([
+          "secrets:",
+          "  token:",
+          "    file: ./token.txt",
+          "services:",
+          "  web:",
+          "    image: nginx:1.25.3",
+          "    ports:",
+          "      - \"18091:80\"",
+          "      - \"18092:81\"",
+          "      - \"18093:53/udp\"",
+          "    depends_on: [api]",
+          "    cap_add: [NET_ADMIN]",
+          "    volumes:",
+          "      - ./conf/default.conf:/etc/nginx/conf.d/default.conf:ro",
+          "      - ./site:/usr/share/nginx/html",
+          "      - cache:/var/cache/extra",
+          "      - /var/run/docker.sock:/var/run/docker.sock",
+          "    secrets: [token]",
+          "  api:",
+          "    image: traefik/whoami:v1.11",
+          "volumes:",
+          "  cache: {}",
+        ]),
+      )
+      .withNewFile(
+        "stack/conf/default.conf",
+        lines([
+          "server {",
+          "  listen 80;",
+          "  location / { root /usr/share/nginx/html; }",
+          "  location /who/ { proxy_pass http://api:80/; }",
+          "  location /secret { default_type text/plain; alias /run/secrets/token; }",
+          "}",
+          "server {",
+          "  listen 81;",
+          "  location / { default_type text/plain; return 200 \"second\\n\"; }",
+          "}",
+        ]),
+      )
+      .withNewFile("stack/site/index.html", "from the bind mount\n")
+      .withNewFile("stack/token.txt", "s3cret\n")
+      .asWorkspace
+  }
+
+  """
+  up publishes every TCP port of the selected services, starts the services
+  they depend on, and applies bind mounts and file secrets; what it can't
+  reproduce is reported as warnings.
+  """
+  upStackCheck: Void @check {
+    let ws = stack
+    let services = docker.compose.projects(ws).get(key: "stack").services(ws)
+    let front = services.subset(keys: ["web"]).batch.up(ws)
+    let ports = front.ports.{{port}}.map { p => toString(p.port) }
+    assert(same(ports, ["18091", "18092"]), "published ports: " + ports.join(", "))
+    let out = container
+      .from("alpine:3.20")
+      .withServiceBinding("front", front)
+      .withExec([
+        "sh",
+        "-c",
+        "wget -qO- http://front:18091/ && wget -qO- http://front:18091/who/ | grep -m1 Hostname "
+          + "&& wget -qO- http://front:18091/secret && wget -qO- http://front:18092/",
+      ])
+      .stdout
+    assert(
+      out.contains("from the bind mount")
+        and out.contains("Hostname")
+        and out.contains("s3cret")
+        and out.contains("second"),
+      "the stack did not serve its mounts, dependency, secret and second port: " + out,
+    )
+
+    let warnings = services.get(key: "web").warnings(ws)
+    assert(
+      warnings.any { w => w.contains("18093->53/udp is not published") }
+        and warnings.any { w => w.contains("bind mount /var/run/docker.sock is not mounted") }
+        and warnings.any { w => w == "cap_add is ignored" },
+      "warnings: " + warnings.join("; "),
+    )
+    assert(services.get(key: "api").warnings(ws).length == 0, "api has warnings")
+
+    # injectServices binds the dependency of a selected service too.
+    let injected = docker(composeBase: container.from("alpine:3.20"))
+      .compose
+      .projects(ws)
+      .get(key: "stack")
+      .services(ws)
+      .subset(keys: ["web"])
+      .batch
+      .injectServices(ws)
+      .withExec(["sh", "-c", "wget -qO- http://web:80/ && wget -qO- http://api:80 | grep -m1 Hostname"])
+      .stdout
+    assert(
+      injected.contains("from the bind mount") and injected.contains("Hostname"),
+      "injected: " + injected,
+    )
+    null
+  }
+
+  """
+  Compose's override file is merged in: its services are listed, and builds
+  use its settings.
+  """
+  overrideCheck: Void @check {
+    let ws = directory
+      .withNewFile(
+        "compose.yaml",
+        lines(["services:", "  app:", "    build:", "      context: .", "      target: one"]),
+      )
+      .withNewFile(
+        "compose.override.yaml",
+        lines(["services:", "  app:", "    build:", "      target: two", "  extra:", "    image: alpine:3.20"]),
+      )
+      .withNewFile(
+        "Dockerfile",
+        lines(["FROM alpine:3.20 AS one", "RUN exit 3", "", "FROM alpine:3.20 AS two", "RUN true"]),
+      )
+      .asWorkspace
+    let project = docker.compose.projects(ws).get(key: ".")
+    assert(project.overridePath(ws) == "compose.override.yaml", "overridePath")
+    let services = project.services(ws)
+    assert(same(services.keys, ["app", "extra"]), "service keys: " + services.keys.join(", "))
+    run(services.batch.buildService(ws))
+    null
+  }
+
+  """
+  A UTF-8 byte order mark does not hide the first service or stage.
+  """
+  bomCheck: Void @check {
+    let bom = "\ufeff"
+    let keys = serviceKeys(bom + lines(["services:", "  web:", "    image: a", "  db:", "    image: b"]))
+    assert(same(keys, ["db", "web"]), "services after a BOM: " + keys.join(", "))
+    let ws = directory
+      .withNewFile("Dockerfile", bom + lines(["FROM alpine:3.20 AS first", "FROM alpine:3.20"]))
+      .asWorkspace
+    let stages = docker.projects(ws).get(key: ".").stages(ws).keys
+    assert(same(stages, ["first"]), "stages after a BOM: " + stages.join(", "))
+    null
+  }
+
+  """
+  A build context outside the Compose project but inside the workspace is
+  built; one outside the workspace is refused.
+  """
+  buildContextCheck: Void @check {
+    let ws = directory
+      .withNewFile("svc/compose.yaml", lines(["services:", "  app:", "    build: ../shared"]))
+      .withNewFile("shared/Dockerfile", cleanDockerfile)
+      .withNewFile("compose.yaml", lines(["services:", "  away:", "    build: ../elsewhere"]))
+      .asWorkspace
+    let projects = docker.compose.projects(ws)
+    run(projects.get(key: "svc").services(ws).batch.buildService(ws))
+    let away = failure(
+      projects.get(key: ".").services(ws).batch.buildService(ws),
+    )
+    assert(
+      away.contains("only directories inside the workspace can be built"),
+      "outside the workspace: " + away,
+    )
+    null
+  }
+
+  """
+  Failure messages name the item, drop the engine's internal IDs, and point
+  at the trace; hadolint output carries no colour codes.
+  """
+  failureMessageCheck: Void @check {
+    let ws = directory
+      .withNewFile("broken/Dockerfile", lines(["FROM alpine:3.20", "RUN exit 3"]))
+      .withNewFile("unlinted/Dockerfile", lines(["FROM alpine", "RUN apk add curl"]))
+      .asWorkspace
+    let projects = docker.projects(ws)
+    let build = failure(projects.get(key: "broken").build(ws))
+    assert(
+      build.contains("broken: docker build failed: ")
+        and build.contains("the failing step's output is in the trace")
+        and build.containsMatch(`[A-Za-z]+@[A-Za-z0-9+/=]{40,}|xxh3:`) == false,
+      "build failure: " + build,
+    )
+    let lint = failure(projects.get(key: "unlinted").lint(ws))
+    assert(lint.contains("DL3018") and lint.containsMatch(`\x1b`) == false, "hadolint output: " + lint)
+    null
+  }
+
+  """
+  hadolint reads the nearest .hadolint.yaml up to the workspace root, and
+  lintArgs reach it.
+  """
+  hadolintConfigCheck: Void @check {
+    let ws = directory
+      .withNewFile(".hadolint.yaml", lines(["ignored:", "  - DL3018", "  - DL3019"]))
+      .withNewFile("app/Dockerfile", lines(["FROM alpine:3.20", "RUN apk add curl"]))
+      .withNewFile("strict/.hadolint.yml", lines(["ignored: []"]))
+      .withNewFile("strict/Dockerfile", lines(["FROM alpine:3.20", "RUN apk add curl"]))
+      .withNewFile("warn/Dockerfile", lines(["FROM alpine:3.20", "RUN cd /tmp && echo hi"]))
+      .asWorkspace
+    let projects = docker.projects(ws)
+    run(projects.get(key: "app").lint(ws))
+    let strict = failure(projects.get(key: "strict").lint(ws))
+    assert(strict.contains("DL3018"), "the nearer config did not win: " + strict)
+    let warn = failure(projects.get(key: "warn").lint(ws))
+    assert(warn.contains("DL3003"), "DL3003 was not reported: " + warn)
+    run(
+      docker(lintArgs: ["--failure-threshold", "error"]).projects(ws).get(key: "warn").lint(ws),
+    )
+    null
+  }
+
+  """
+  buildTarget picks the stage the project build check builds where the
+  Dockerfile declares it, and that stage leaves the stages dimension.
+  """
+  buildTargetCheck: Void @check {
+    let ws = directory
+      .withNewFile(
+        "app/Dockerfile",
+        lines(["FROM alpine:3.20 AS prod", "RUN true", "", "FROM alpine:3.20 AS test", "RUN true", "", "FROM alpine:3.20", "RUN exit 3"]),
+      )
+      .withNewFile("plain/Dockerfile", cleanDockerfile)
+      .asWorkspace
+    let targeted = docker(buildTarget: "prod").projects(ws)
+    run(targeted.batch.build(ws))
+    assert(same(targeted.get(key: "app").stages(ws).keys, ["test"]), "buildTarget stayed a stage key")
+    let plain = failure(docker.projects(ws).get(key: "app").build(ws))
+    assert(plain.contains("docker build failed"), "the final stage was not built without buildTarget: " + plain)
     null
   }
 }

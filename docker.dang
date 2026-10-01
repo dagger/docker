@@ -11,6 +11,23 @@ type Docker {
   lintImage: String! = "docker.io/hadolint/hadolint:v2.14.0-alpine"
 
   """
+  Extra hadolint arguments, e.g. ["--failure-threshold", "warning"].
+  """
+  lintArgs: [String!]! = []
+
+  """
+  Stage the project build check builds in Dockerfiles that declare it, e.g.
+  "production". Empty, or a stage a Dockerfile doesn't declare, builds the
+  final stage.
+  """
+  buildTarget: String! = ""
+
+  """
+  Image providing the standalone Compose binary at /docker-compose.
+  """
+  composeImage: String! = "docker.io/docker/compose-bin:v5.5.0"
+
+  """
   Container that Compose services are attached to by injectServices.
   A blank container by default; override it in dagger.toml, e.g.
 
@@ -121,8 +138,24 @@ type Docker {
       ctr.sync
       null
     } rescue {
-      err: Error => step + ":\n" + err.message.trimSpace.split("\n").takeLast(20).join("\n")
+      err: Error => step + ": " + cleanError(err.message)
+        + "\n(the failing step's output is in the trace)"
     }
+  }
+
+  """
+  An engine error without the internal object IDs and load chains it wraps
+  around the actual cause.
+  """
+  let cleanError(message: String!): String! {
+    message
+      .rewriteMatches(`load [A-Za-z]+@[A-Za-z0-9+/=_-]+: `) { m => "" }
+      .rewriteMatches(`(?:load xxh3:[0-9a-f]+: (?:inputs: )?)+`) { m => "" }
+      .rewriteMatches(`failed to load container from converted ID: `) { m => "" }
+      .trimSpace
+      .split("\n")
+      .takeLast(20)
+      .join("\n")
   }
 
   """
@@ -593,17 +626,33 @@ type DockerProject {
   }
 
   """
-  Named stages of this project's Dockerfile that a default build never
-  reaches: no other stage references them, and they are not the final stage.
-  Keyed by stage name.
+  The stage the build check builds: the buildTarget setting when this
+  Dockerfile declares it, else "" for the final stage.
   """
-  stages(ws: Workspace!): DockerfileStages! {
+  let defaultTarget(ws: Workspace!): String! {
+    let wanted = tool.buildTarget.toLower
+    if (wanted != "" and allStages(ws).any { s => (s.name ?? "").toLower == wanted }) {
+      tool.buildTarget
+    } else {
+      ""
+    }
+  }
+
+  """
+  Named stages of this project's Dockerfile that its build never reaches: no
+  other stage references them, and they are neither the final stage nor the
+  buildTarget setting. Keyed by stage name.
+  """
+  stages(ws: Workspace!): DockerStages! {
     let all = allStages(ws)
     let last = all.length - 1
+    let target = tool.buildTarget.toLower
     let names = all
-      .filter { s => s.name != null and s.referenced == false and s.index != last }
+      .filter { s =>
+        s.name != null and s.referenced == false and s.index != last and (s.name ?? "").toLower != target
+      }
       .map { s => s.name ?? "" }
-    DockerfileStages(names: tool.sorted(names.uniq), all: all, project: self)
+    DockerStages(names: tool.sorted(names.uniq), all: all, project: self)
   }
 
   """
@@ -614,8 +663,8 @@ type DockerProject {
   line-based: a FROM inside a heredoc or after a line continuation is not
   distinguished from a real instruction.
   """
-  allStages(ws: Workspace!): [DockerfileStage!]! {
-    let empty: [DockerfileStage!]! = []
+  allStages(ws: Workspace!): [DockerStage!]! {
+    let empty: [DockerStage!]! = []
     {
       parseStages(ws.file(tool.absolutePath(dockerfilePath)).contents)
     } rescue {
@@ -626,7 +675,7 @@ type DockerProject {
   """
   Return the named build stage of this project's Dockerfile.
   """
-  stage(ws: Workspace!, name: String!): DockerfileStage! {
+  stage(ws: Workspace!, name: String!): DockerStage! {
     let found = allStages(ws).filter { candidate => candidate.name == name }[0]
     if (found == null) {
       raise "no stage named \"" + name + "\" in " + dockerfilePath
@@ -638,7 +687,9 @@ type DockerProject {
   """
   The stages declared by a Dockerfile's contents.
   """
-  let parseStages(contents: String!): [DockerfileStage!]! {
+  let parseStages(text: String!): [DockerStage!]! {
+    # A leading byte order mark would hide the first FROM.
+    let contents = text.rewriteMatches(`^\x{FEFF}`) { m => "" }
     let fromMatches = contents.matchAll("(?im)^\\s*FROM\\s+(?:--\\S+\\s+)*(\\S+)(?:\\s+AS\\s+(\\S+))?")
     # Stage references, lowercased since stage names are case-insensitive:
     # FROM bases, COPY/ADD --from=<ref>, and RUN --mount=...,from=<ref>.
@@ -648,7 +699,7 @@ type DockerProject {
     fromMatches.map { m, i =>
       let stageName = m.captures[1]
       let name = if (stageName == "" or stageName == null) { null } else { stageName }
-      DockerfileStage(
+      DockerStage(
         project: self,
         index: i,
         base: m.captures[0] ?? "",
@@ -663,12 +714,23 @@ type DockerProject {
   Why hadolint failed on this project's Dockerfile, or null.
   """
   let lintFailure(ws: Workspace!): String {
-    let ran = Dagger
+    let config = hadolintConfig(ws)
+    let base = Dagger
       .container
       .from(tool.lintImage)
       .withWorkdir("/src")
       .withDirectory(".", buildContext(ws), include: ["Dockerfile"])
-      .withExec(["hadolint", "Dockerfile"], expect: ReturnType.ANY)
+    let empty: [String!]! = []
+    let configured = if (config == null) {
+      base
+    } else {
+      base.withFile("/config/hadolint.yaml", ws.file(config ?? ""))
+    }
+    let configArgs = if (config == null) { empty } else { ["--config", "/config/hadolint.yaml"] }
+    let ran = configured.withExec(
+      ["hadolint", "--no-color"] + configArgs + tool.lintArgs + ["Dockerfile"],
+      expect: ReturnType.ANY,
+    )
     let code = ran.exitCode
     if (code == 0) {
       null
@@ -679,10 +741,25 @@ type DockerProject {
   }
 
   """
+  The nearest .hadolint.yaml or .hadolint.yml from this project's directory
+  up to the workspace root, as a workspace-root-absolute path, or null.
+  """
+  let hadolintConfig(ws: Workspace!): String {
+    let start = tool.absolutePath(path)
+    let found = [ws.findUp(".hadolint.yaml", start), ws.findUp(".hadolint.yml", start)]
+      .map { f => f ?? "" }
+      .filter { f => f != "" }
+    # The deeper file is the nearer one.
+    found.reduce(null) { best, f =>
+      if (best == null or f.split("/").length > (best ?? "").split("/").length) { f } else { best }
+    }
+  }
+
+  """
   Why building this project's Dockerfile failed, or null.
   """
   let buildFailure(ws: Workspace!): String {
-    tool.stepFailure("docker build failed", container(ws))
+    tool.stepFailure("docker build failed", container(ws, target: defaultTarget(ws)))
   }
 }
 
@@ -690,7 +767,7 @@ type DockerProject {
 Named stages of a Dockerfile that a default build never reaches, keyed by
 stage name.
 """
-type DockerfileStages @collection {
+type DockerStages @collection {
   """
   Stage names.
   """
@@ -699,14 +776,14 @@ type DockerfileStages @collection {
   """
   Every stage of the Dockerfile, for looking up a key.
   """
-  let all: [DockerfileStage!]!
+  let all: [DockerStage!]!
 
   let project: DockerProject!
 
   """
   The Dockerfile stage with this name.
   """
-  stage(name: String!): DockerfileStage! @get {
+  stage(name: String!): DockerStage! @get {
     let found = all.filter { s => s.name == name }[0]
     if (found == null) {
       raise "no stage named \"" + name + "\""
@@ -718,7 +795,7 @@ type DockerfileStages @collection {
   """
   Build the selected stages.
   """
-  build(ws: Workspace!): Void @check {
+  buildStage(ws: Workspace!): Void @check {
     let failures = names.map { n => stage(n) }.{{label, failure: buildFailure(ws)}}
       .filter { r => r.failure != null }
       .map { r => r.label + ": " + (r.failure ?? "") }
@@ -738,7 +815,7 @@ type DockerfileStages @collection {
 """
 A build stage of a Docker project's Dockerfile.
 """
-type DockerfileStage {
+type DockerStage {
   """
   The Docker project whose Dockerfile declares this stage.
   """
@@ -795,7 +872,7 @@ type DockerfileStage {
   """
   Build this Dockerfile stage.
   """
-  build(ws: Workspace!): Void @check {
+  buildStage(ws: Workspace!): Void @check {
     let failure = buildFailure(ws)
     if (failure != null) {
       raise label + ": " + (failure ?? "")

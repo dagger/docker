@@ -524,6 +524,8 @@ type E2e {
           "    ports:",
           "      - \"18091:80\"",
           "      - \"18092:81\"",
+          "      - \"18094:80\"",
+          "      - \"80:80\"",
           "      - \"18093:53/udp\"",
           "    depends_on: [api]",
           "    cap_add: [NET_ADMIN]",
@@ -535,8 +537,23 @@ type E2e {
           "    secrets: [token]",
           "  api:",
           "    image: traefik/whoami:v1.11",
+          "  seeded:",
+          "    image: nginx:1.25.3",
+          "    ports:",
+          "      - \"18095:80\"",
+          "    volumes:",
+          "      - html:/usr/share/nginx/html",
+          "  writer:",
+          "    image: alpine:3.20",
+          "    user: nobody",
+          "    volumes:",
+          "      - scratch:/data",
+          "      - logs:/var/log",
           "volumes:",
           "  cache: {}",
+          "  html: {}",
+          "  scratch: {}",
+          "  logs: {}",
         ]),
       )
       .withNewFile(
@@ -567,9 +584,9 @@ type E2e {
   upStackCheck: Void @check {
     let ws = stack
     let services = docker.compose.projects(ws).get(key: "stack").services(ws)
-    let front = services.subset(keys: ["web"]).batch.up(ws)
+    let front = services.subset(keys: ["web", "seeded"]).batch.up(ws)
     let ports = front.ports.{{port}}.map { p => toString(p.port) }
-    assert(same(ports, ["18091", "18092"]), "published ports: " + ports.join(", "))
+    assert(same(ports, ["18095", "18091", "18092", "18094", "80"]), "published ports: " + ports.join(", "))
     let out = container
       .from("alpine:3.20")
       .withServiceBinding("front", front)
@@ -577,16 +594,30 @@ type E2e {
         "sh",
         "-c",
         "wget -qO- http://front:18091/ && wget -qO- http://front:18091/who/ | grep -m1 Hostname "
-          + "&& wget -qO- http://front:18091/secret && wget -qO- http://front:18092/",
+          + "&& wget -qO- http://front:18091/secret && wget -qO- http://front:18092/ "
+          + "&& wget -qO- http://front:18094/ && wget -qO- http://front:80/ && wget -qO- http://front:18095/",
       ])
+      # The same target on two more frontends, one of them 80, and a
+      # named volume seeded from the image.
       .stdout
     assert(
       out.contains("from the bind mount")
         and out.contains("Hostname")
         and out.contains("s3cret")
-        and out.contains("second"),
-      "the stack did not serve its mounts, dependency, secret and second port: " + out,
+        and out.contains("second")
+        and out.split("from the bind mount").length == 4
+        and out.contains("Welcome to nginx"),
+      "the stack did not serve its mounts, dependency, secret, ports and seeded volume: " + out,
     )
+
+    # A named volume belongs to the user the service runs as, whether the
+    # image has the directory (/var/log) or not (/data).
+    let written = services
+      .get(key: "writer")
+      .container(ws)
+      .withExec(["sh", "-c", "id -un && echo ok > /data/ok && echo ok > /var/log/ok && cat /data/ok"])
+      .stdout
+    assert(written == "nobody\nok\n", "a non-root service could not write its volumes: " + written)
 
     let warnings = services.get(key: "web").warnings(ws)
     assert(
@@ -691,8 +722,7 @@ type E2e {
     let projects = docker.projects(ws)
     let build = failure(projects.get(key: "broken").build(ws))
     assert(
-      build.contains("broken: docker build failed: ")
-        and build.contains("the failing step's output is in the trace")
+      build.contains("broken: docker build failed (exit code 3 in a RUN step; see the trace for its output)")
         and build.containsMatch(`[A-Za-z]+@[A-Za-z0-9+/=]{40,}|xxh3:`) == false,
       "build failure: " + build,
     )

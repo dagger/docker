@@ -478,7 +478,9 @@ type DockerComposeProject {
       r.ports.reduce(f) { g, p =>
         g.withService(
           service: r.service,
-          name: r.name + "-" + toString(p.target),
+          # Named per frontend port: one service may publish the same target
+          # port on several frontend ports.
+          name: r.name + "-" + toString(if (p.published == 0) { p.target } else { p.published }),
           frontend: if (p.published == 0) { p.target } else { p.published },
           backend: p.target,
           isTcp: true,
@@ -491,7 +493,11 @@ type DockerComposeProject {
     # Bind every service to the proxy so the ones nothing else reaches start
     # too.
     running
-      .reduce(front.ctr) { c, r => c.withServiceBinding(r.name, r.service) }
+      # The nginx image's stock HTTP server listens on 80, which would keep a
+      # TCP frontend on 80 from binding; every frontend here is a TCP stream.
+      .reduce(front.ctr.withoutFile("/etc/nginx/conf.d/default.conf")) { c, r =>
+        c.withServiceBinding(r.name, r.service)
+      }
       .asService(args: ["nginx", "-g", "daemon off;"])
   }
 
@@ -565,7 +571,20 @@ type DockerComposeProject {
       if (m.kind == "tmpfs") {
         ctr.withMountedTemp(m.target)
       } else if (m.kind == "volume") {
-        ctr.withMountedCache(m.target, cacheVolume("docker-compose:" + path + ":" + m.source))
+        # Like a new Docker volume, the cache starts as a copy of the image's
+        # directory at the target when there is one, and belongs to the user
+        # the service runs as.
+        let volume = cacheVolume("docker-compose:" + path + ":" + m.source)
+        if (image.exists(m.target, expectedType: ExistsType.DIRECTORY_TYPE)) {
+          ctr.withMountedCache(
+            m.target,
+            volume,
+            source: image.directory(m.target),
+            inheritOwner: true,
+          )
+        } else {
+          ctr.withMountedCache(m.target, volume, inheritOwner: true)
+        }
       } else {
         let kind = entryKind(ws, m.source)
         if (kind == "directory") {

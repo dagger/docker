@@ -138,8 +138,21 @@ type Docker {
       ctr.sync
       null
     } rescue {
-      err: Error => step + ": " + cleanError(err.message)
-        + "\n(the failing step's output is in the trace)"
+      err: Error => step + " (" + failureDetail(err.message) + ")"
+    }
+  }
+
+  """
+  What an engine error says about a failed step: the exit code of a RUN
+  step when it carries one, else the error without the engine's internal
+  object IDs and load chains; either way, a pointer to the trace.
+  """
+  let failureDetail(message: String!): String! {
+    let code = message.matchAll(`exit code: (\d+)`).map { m => m.captures[0] ?? "" }.takeLast(1).join("")
+    if (code != "") {
+      "exit code " + code + " in a RUN step; see the trace for its output"
+    } else {
+      cleanError(message) + "; see the trace for details"
     }
   }
 

@@ -1,3 +1,6 @@
+[modules.e2e]
+source = ".dagger/modules/e2e"
+
 [modules.proxy]
 source = "https://github.com/dagger/proxy"
 # Nginx version used for the default base container.
@@ -16,3 +19,8 @@ module = "dagger-dang-sdk"
 clients = ["https://github.com/dagger/proxy@3224e8981d8c8f04a0c238dc933b7415a2a6349f"]
 is-module = true
 name = "docker"
+
+[sdks.dang.scopes.".dagger/modules/e2e"]
+clients = ["./."]
+is-module = true
+name = "e2e"

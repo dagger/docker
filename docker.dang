@@ -32,17 +32,11 @@ type Docker {
   composeEnvs: [String!]! = []
 
   """
-  The Docker projects visible from the client's cwd: every directory at or
-  below it holding a Dockerfile, plus the nearest enclosing project when the
-  cwd holds no Dockerfile of its own. Paths are cwd-relative, so a ".." prefix
-  marks an enclosing project.
+  Docker projects at or below the working directory, keyed by the directory
+  holding their Dockerfile.
   """
-  projects(ws: Workspace!): [DockerProject!]! {
-    ws
-      .findRoots(markers: ["Dockerfile"])
-      .map { projectPath =>
-        DockerProject(path: projectPath, lintImage: lintImage)
-      }
+  projects(ws: Workspace!): DockerProjects! {
+    DockerProjects(paths: roots(ws, ["Dockerfile"]), tool: self)
   }
 
   """
@@ -52,100 +46,96 @@ type Docker {
   findUp to false when path is already a project root and no lookup is needed.
   """
   project(ws: Workspace!, path: String!, findUp: Boolean! = true): DockerProject! {
-    DockerProject(
-      path: if (findUp) {
-        let foundDockerfilePath = ws.findUp("Dockerfile", path)
-        if (foundDockerfilePath == null) {
-          raise "no Docker project found containing path: " + path
-        } else {
-          relativeToCwd(ws, foundDockerfilePath)
-        }
+    if (findUp) {
+      let foundDockerfilePath = ws.findUp("Dockerfile", path)
+      if (foundDockerfilePath == null) {
+        raise "no Docker project found containing path: " + path
       } else {
-        path
-      },
-      lintImage: lintImage,
-    )
+        projectAt(directoryOf(foundDockerfilePath ?? ""))
+      }
+    } else {
+      projectAt(rootPath(ws, path))
+    }
   }
 
   """
-  Return the directory of a workspace-root-absolute file path, relative to the
-  client's cwd: "/a/b/Dockerfile" from cwd "a" is "b", from "a/b/c" is "..".
+  The Docker project rooted at a workspace-root-relative path.
   """
-  let relativeToCwd(ws: Workspace!, filePath: String!): String! {
-    let dirSegments = filePath.trimPrefix("/").split("/").dropLast(1)
-    let cwdSegments = ws.cwd.trimPrefix("/").split("/").filter { segment =>
-      segment != "" and segment != "."
-    }
-    # Longest common prefix: acc only advances while every prior segment matched.
-    let common = cwdSegments.map { segment, i => i }.reduce(0) { acc, i =>
-      if (acc == i and dirSegments[i] == cwdSegments[i]) { acc + 1 } else { acc }
-    }
-    let segments = cwdSegments.dropFirst(common).map { segment => ".." }
-      + dirSegments.dropFirst(common)
+  let projectAt(path: String!): DockerProject! {
+    DockerProject(path: path, tool: self)
+  }
+
+  """
+  Workspace-root-relative directories holding one of markers at or below the
+  working directory, plus the nearest enclosing one when the working
+  directory holds none. Unique and sorted.
+  """
+  let roots(ws: Workspace!, markers: [String!]!): [String!]! {
+    sorted(ws.findRoots(markers: markers).map { dir => rootPath(ws, dir) }.uniq)
+  }
+
+  """
+  Resolve a path relative to the caller's location, as findRoots returns
+  them, into a workspace-root-relative one, collapsing any leading "..".
+  """
+  let rootPath(ws: Workspace!, cwdRelPath: String!): String! {
+    let segments = cwdRelPath.split("/").filter { s => s != "" and s != "." }
+    let up = segments.filter { s => s == ".." }.length
+    let down = segments.filter { s => s != ".." }
+    let resolved = ws.cwd.split("/").filter { s => s != "" and s != "." }.dropLast(up) + down
+    if (resolved.length == 0) { "." } else { resolved.join("/") }
+  }
+
+  """
+  The workspace-root-relative directory of a workspace-root-absolute file
+  path: "/a/b/Dockerfile" is "a/b", "/Dockerfile" is ".".
+  """
+  let directoryOf(filePath: String!): String! {
+    let segments = filePath.split("/").filter { s => s != "" and s != "." }.dropLast(1)
     if (segments.length == 0) { "." } else { segments.join("/") }
   }
 
   """
-  Lint the Dockerfile of every project visible from the client's cwd. A cwd
-  holding no Dockerfile of its own sits inside its enclosing project, so that
-  project is linted too; enter a subproject to lint it alone.
+  A workspace-root-relative path in the form Workspace.file and
+  Workspace.directory read from the workspace root.
   """
-  lintAll(ws: Workspace!): Void @check {
-    let layers = projects(ws).map { project, i =>
-      directory.withFile(toString(i) + "/Dockerfile", project.lintExec(ws).file("Dockerfile"))
-    }.reduce(directory) { merged, layer => merged.withDirectory(".", layer) }
-    # FIXME: replace this when Dagger can directly run multiple containers in
-    # parallel. For now, merge one file from each project's lint container into
-    # a directory (keyed by project position, since a cwd-relative ".." path
-    # is not a valid directory name) and sync it to force every lint command
-    # to run.
-
-    layers.sync
-    null
+  let absolutePath(path: String!): String! {
+    if (path == ".") { "/" } else { "/" + path }
   }
 
   """
-  Build every project visible from the client's cwd.
+  items in byte order.
   """
-  buildAll(ws: Workspace!): Void @check {
-    let layers = projects(ws).map { project, i =>
-      directory.withDirectory(toString(i), project.build(ws).rootfs)
-    }.reduce(directory) { merged, layer => merged.withDirectory(".", layer) }
-    # FIXME: replace this when Dagger can directly run multiple containers in
-    # parallel. For now, merge each built container's rootfs into a directory
-    # (keyed by project position, since a cwd-relative ".." path is not a
-    # valid directory name) and sync it to force every build to run.
-
-    layers.sync
-    null
+  let sorted(items: [String!]!): [String!]! {
+    let empty: [String!]! = []
+    items.reduce(empty) { acc, item =>
+      acc.takeWhile { x => x <= item } + [item] + acc.dropWhile { x => x <= item }
+    }
   }
 
   """
-  Build every named Dockerfile stage that no other stage references.
-
-  A default build only exercises the final stage and its dependency chain;
-  this check covers the stages a default build never reaches, such as test
-  or lint stages.
+  Why syncing ctr failed, or null: step and the end of the error.
   """
-  buildUnrefStages(ws: Workspace!): Void @check {
-    let layers = projects(ws).map { project, i =>
-      project
-        .stages(ws)
-        .filter { stage => stage.name != null and stage.referenced == false }
-        .reduce(directory) { stageLayers, stage =>
-          stageLayers.withDirectory(
-            toString(i) + "/" + (stage.name ?? ""),
-            stage.build(ws).rootfs,
-          )
-        }
-    }.reduce(directory) { merged, layer => merged.withDirectory(".", layer) }
-    # FIXME: replace this when Dagger can directly run multiple containers in
-    # parallel. For now, merge each built stage's rootfs into a directory
-    # (keyed by project position, since a cwd-relative ".." path is not a
-    # valid directory name) and sync it to force every stage build to run.
+  let stepFailure(step: String!, ctr: Container!): String {
+    {
+      ctr.sync
+      null
+    } rescue {
+      err: Error => step + ":\n" + err.message.trimSpace.split("\n").takeLast(20).join("\n")
+    }
+  }
 
-    layers.sync
-    null
+  """
+  The failures of a batch, one line per failing item, under a heading; null
+  when nothing failed.
+  """
+  let report(heading: String!, total: Int!, unit: String!, failures: [String!]!): String {
+    if (failures.length == 0) {
+      null
+    } else {
+      heading + " in " + toString(failures.length) + " of " + toString(total) + " " + unit + ":\n"
+        + failures.map { f => "- " + f }.join("\n")
+    }
   }
 
   """
@@ -189,10 +179,10 @@ type Docker {
   }
 
   """
-  Tools for validating Docker Compose projects.
+  Tools for validating and running Docker Compose projects.
   """
   compose: Compose! {
-    Compose
+    Compose(tool: self)
   }
 
   """
@@ -210,46 +200,13 @@ type Docker {
   The base container is the module's composeBase, blank by default; override
   it in dagger.toml via settings.composeBase. Any composeEnvs entries are set
   on it as environment variables.
+
+  To attach only some services, use injectServices on a subset of a
+  project's services collection.
   """
   injectServices(ws: Workspace!): Container! {
-    let detected = compose.projects(ws)
-    if (detected.length > 1) {
-      raise "multiple Compose projects detected ("
-        + detected.map { project => project.path }.join(", ")
-        + "); enter a project directory to choose one"
-    }
-    let single = detected[0]
-    if (single == null) {
-      raise "no Compose project detected"
-    } else {
-      single
-        .serviceSpecs(ws)
-        .filter { spec => spec.image != "" or spec.buildContext != "" }
-        .reduce(composeBaseWithEnvs) { ctr, spec =>
-          let built = spec
-            .environment
-            .reduce(
-              if (spec.image != "") {
-                container.from(spec.image)
-              } else {
-                single.buildContextDir(ws, spec.buildContext).dockerBuild(
-                  buildArgs: spec.buildArgs.map { arg =>
-                    BuildArg(name: arg.name, value: arg.value)
-                  },
-                )
-              },
-            ) { c, env => c.withEnvVariable(env.name, env.value) }
-          let exposed = if (spec.target == 0) {
-            built
-          } else {
-            built.withExposedPort(spec.target)
-          }
-          ctr.withServiceBinding(
-            spec.name,
-            exposed.asService(useEntrypoint: true).withHostname(spec.name),
-          )
-        }
-    }
+    let single = compose.single(ws)
+    single.inject(ws, single.serviceSpecs(ws))
   }
 
   """
@@ -435,7 +392,7 @@ type CLI {
       .split("\n")
       .filter { line => line != "" }
       .map { line =>
-        fromJSON(line) :: {{ID: String!, Repository: String!, Tag: String!}}!
+        JSON.decode(line) :: {{ID: String!, Repository: String!, Tag: String!}}!
       }
       .filter { info =>
         (repository == "" or repository == info.Repository)
@@ -518,52 +475,87 @@ type Image {
 }
 
 """
+Docker projects in a workspace, keyed by the directory holding their
+Dockerfile.
+"""
+type DockerProjects @collection {
+  """
+  Project root paths, relative to the workspace root.
+  """
+  paths: [String!]! @keys
+
+  let tool: Docker!
+
+  """
+  The Docker project rooted at path.
+  """
+  project(path: String!): DockerProject! @get {
+    tool.projectAt(path)
+  }
+
+  """
+  Lint the Dockerfiles of the selected projects with hadolint.
+  """
+  lint(ws: Workspace!): Void @check {
+    # A selection over a list evaluates its elements concurrently, so every
+    # project is linted in parallel and every failure is reported.
+    let failures = paths.map { p => project(p) }.{{path, failure: lintFailure(ws)}}
+      .filter { r => r.failure != null }
+      .map { r => r.path + ": " + (r.failure ?? "") }
+    let failed = tool.report("hadolint failed", paths.length, "projects", failures)
+    if (failed != null) {
+      raise failed ?? ""
+    }
+    null
+  }
+
+  """
+  Build the Dockerfiles of the selected projects.
+  """
+  build(ws: Workspace!): Void @check {
+    let failures = paths.map { p => project(p) }.{{path, failure: buildFailure(ws)}}
+      .filter { r => r.failure != null }
+      .map { r => r.path + ": " + (r.failure ?? "") }
+    let failed = tool.report("docker build failed", paths.length, "projects", failures)
+    if (failed != null) {
+      raise failed ?? ""
+    }
+    null
+  }
+}
+
+"""
 A Docker project rooted at a directory containing a Dockerfile.
 """
 type DockerProject {
   """
-  Path of this project root, relative to the client's cwd. A ".." prefix
-  marks an enclosing project.
+  Project root, relative to the workspace root.
   """
   path: String!
 
-  """
-  Image used for Dockerfile linting.
-  """
-  let lintImage: String!
+  let tool: Docker!
 
   """
-  Return a cwd-relative path for a project-relative subpath.
-  """
-  let subpath(relativePath: String!): String! {
-    if (path == ".") {
-      relativePath
-    } else {
-      path.trimSuffix("/") + "/" + relativePath
-    }
-  }
-
-  """
-  Cwd-relative path of this project's Dockerfile.
+  Workspace-root-relative path of this project's Dockerfile.
   """
   dockerfilePath: String! {
-    subpath("Dockerfile")
+    if (path == ".") { "Dockerfile" } else { path + "/Dockerfile" }
   }
 
   """
   Build context mounted for this project's Docker commands.
   """
   buildContext(ws: Workspace!): Directory! {
-    ws.directory(path)
+    ws.directory(tool.absolutePath(path))
   }
 
   """
-  Build the container from this project's Dockerfile.
+  The container built from this project's Dockerfile.
   """
-  build(
+  container(
     ws: Workspace!,
     """
-    Target build stage to build.
+    Target build stage to build. Empty builds the final stage.
     """
     target: String! = "",
     """
@@ -579,6 +571,42 @@ type DockerProject {
   }
 
   """
+  Lint this project's Dockerfile with hadolint.
+  """
+  lint(ws: Workspace!): Void @check {
+    let failure = lintFailure(ws)
+    if (failure != null) {
+      raise path + ": " + (failure ?? "")
+    }
+    null
+  }
+
+  """
+  Build this project's Dockerfile.
+  """
+  build(ws: Workspace!): Void @check {
+    let failure = buildFailure(ws)
+    if (failure != null) {
+      raise path + ": " + (failure ?? "")
+    }
+    null
+  }
+
+  """
+  Named stages of this project's Dockerfile that a default build never
+  reaches: no other stage references them, and they are not the final stage.
+  Keyed by stage name.
+  """
+  stages(ws: Workspace!): DockerfileStages! {
+    let all = allStages(ws)
+    let last = all.length - 1
+    let names = all
+      .filter { s => s.name != null and s.referenced == false and s.index != last }
+      .map { s => s.name ?? "" }
+    DockerfileStages(names: tool.sorted(names.uniq), all: all, project: self)
+  }
+
+  """
   Build stages declared in this project's Dockerfile, in declaration order.
 
   Stages are parsed from FROM instructions as described in the Dockerfile
@@ -586,8 +614,31 @@ type DockerProject {
   line-based: a FROM inside a heredoc or after a line continuation is not
   distinguished from a real instruction.
   """
-  stages(ws: Workspace!): [DockerfileStage!]! {
-    let contents = ws.file(dockerfilePath).contents
+  allStages(ws: Workspace!): [DockerfileStage!]! {
+    let empty: [DockerfileStage!]! = []
+    {
+      parseStages(ws.file(tool.absolutePath(dockerfilePath)).contents)
+    } rescue {
+      err: Error => empty
+    }
+  }
+
+  """
+  Return the named build stage of this project's Dockerfile.
+  """
+  stage(ws: Workspace!, name: String!): DockerfileStage! {
+    let found = allStages(ws).filter { candidate => candidate.name == name }[0]
+    if (found == null) {
+      raise "no stage named \"" + name + "\" in " + dockerfilePath
+    } else {
+      found
+    }
+  }
+
+  """
+  The stages declared by a Dockerfile's contents.
+  """
+  let parseStages(contents: String!): [DockerfileStage!]! {
     let fromMatches = contents.matchAll("(?im)^\\s*FROM\\s+(?:--\\S+\\s+)*(\\S+)(?:\\s+AS\\s+(\\S+))?")
     # Stage references, lowercased since stage names are case-insensitive:
     # FROM bases, COPY/ADD --from=<ref>, and RUN --mount=...,from=<ref>.
@@ -609,34 +660,78 @@ type DockerProject {
   }
 
   """
-  Return the named build stage of this project's Dockerfile.
+  Why hadolint failed on this project's Dockerfile, or null.
   """
-  stage(ws: Workspace!, name: String!): DockerfileStage! {
-    let found = stages(ws).filter { candidate => candidate.name == name }[0]
+  let lintFailure(ws: Workspace!): String {
+    let ran = Dagger
+      .container
+      .from(tool.lintImage)
+      .withWorkdir("/src")
+      .withDirectory(".", buildContext(ws), include: ["Dockerfile"])
+      .withExec(["hadolint", "Dockerfile"], expect: ReturnType.ANY)
+    let code = ran.exitCode
+    if (code == 0) {
+      null
+    } else {
+      let output = (ran.stdout + "\n" + ran.stderr).trimSpace.split("\n").takeLast(40).join("\n")
+      "hadolint failed (exit " + toString(code) + ")" + (if (output == "") { "" } else { ":\n" + output })
+    }
+  }
+
+  """
+  Why building this project's Dockerfile failed, or null.
+  """
+  let buildFailure(ws: Workspace!): String {
+    tool.stepFailure("docker build failed", container(ws))
+  }
+}
+
+"""
+Named stages of a Dockerfile that a default build never reaches, keyed by
+stage name.
+"""
+type DockerfileStages @collection {
+  """
+  Stage names.
+  """
+  names: [String!]! @keys
+
+  """
+  Every stage of the Dockerfile, for looking up a key.
+  """
+  let all: [DockerfileStage!]!
+
+  let project: DockerProject!
+
+  """
+  The Dockerfile stage with this name.
+  """
+  stage(name: String!): DockerfileStage! @get {
+    let found = all.filter { s => s.name == name }[0]
     if (found == null) {
-      raise "no stage named \"" + name + "\" in " + dockerfilePath
+      raise "no stage named \"" + name + "\""
     } else {
       found
     }
   }
 
   """
-  Lint this project's Dockerfile.
+  Build the selected stages.
   """
-  lint(ws: Workspace!): Void @check {
-    lintExec(ws).sync
+  build(ws: Workspace!): Void @check {
+    let failures = names.map { n => stage(n) }.{{label, failure: buildFailure(ws)}}
+      .filter { r => r.failure != null }
+      .map { r => r.label + ": " + (r.failure ?? "") }
+    let failed = project.tool.report(
+      "docker build failed",
+      names.length,
+      "stages",
+      failures,
+    )
+    if (failed != null) {
+      raise failed ?? ""
+    }
     null
-  }
-
-  """
-  Container synced by this project's lint check.
-  """
-  let lintExec(ws: Workspace!): Container! {
-    container
-      .from(lintImage)
-      .withWorkdir("/src")
-      .withDirectory(".", ws.directory(path, include: ["Dockerfile"]))
-      .withExec(["hadolint", "Dockerfile"])
   }
 }
 
@@ -647,7 +742,7 @@ type DockerfileStage {
   """
   The Docker project whose Dockerfile declares this stage.
   """
-  project: DockerProject!
+  let project: DockerProject!
 
   """
   Zero-based position of this stage in the Dockerfile.
@@ -672,9 +767,16 @@ type DockerfileStage {
   referenced: Boolean!
 
   """
-  Build this stage of the project's Dockerfile.
+  The project path and stage, as failures name them.
   """
-  build(
+  let label: String! {
+    project.path + " (stage " + (name ?? toString(index)) + ")"
+  }
+
+  """
+  The container built from this stage of the project's Dockerfile.
+  """
+  container(
     ws: Workspace!,
     """
     Platform to build for, e.g. "linux/amd64". Defaults to the host platform.
@@ -686,7 +788,25 @@ type DockerfileStage {
       raise "cannot build stage " + toString(index) + " of " + project.dockerfilePath
         + " by target: it has no name"
     } else {
-      project.build(ws, target: target, platform: platform)
+      project.container(ws, target: target ?? "", platform: platform)
     }
+  }
+
+  """
+  Build this Dockerfile stage.
+  """
+  build(ws: Workspace!): Void @check {
+    let failure = buildFailure(ws)
+    if (failure != null) {
+      raise label + ": " + (failure ?? "")
+    }
+    null
+  }
+
+  """
+  Why building this stage failed, or null.
+  """
+  let buildFailure(ws: Workspace!): String {
+    project.tool.stepFailure("docker build failed", container(ws))
   }
 }

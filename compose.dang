@@ -1,5 +1,5 @@
 """
-Tools for validating Docker Compose projects.
+Tools for validating and running Docker Compose projects.
 
 https://docs.docker.com/reference/compose-file/
 """
@@ -8,6 +8,8 @@ type Compose {
   Image providing the standalone Compose binary at /docker-compose.
   """
   composeImage: String! = "index.docker.io/docker/compose-bin"
+
+  let tool: Docker!
 
   """
   Filenames that mark a Compose project, in the order Compose itself prefers
@@ -21,89 +23,75 @@ type Compose {
   ]
 
   """
-  The Compose projects visible from the client's cwd: every directory at or
-  below it holding a Compose file, plus the nearest enclosing project when the
-  cwd holds no Compose file of its own. Paths are cwd-relative, so a ".."
-  prefix marks an enclosing project.
+  Compose projects at or below the working directory, keyed by the directory
+  holding their Compose file.
   """
-  projects(ws: Workspace!): [ComposeProject!]! {
-    ws
-      .findRoots(markers: configNames)
-      .map { projectPath =>
-        ComposeProject(path: projectPath, composeImage: composeImage, configNames: configNames)
-      }
+  projects(ws: Workspace!): ComposeProjects! {
+    ComposeProjects(paths: tool.roots(ws, configNames), compose: self)
   }
 
   """
-  Run the services of the Compose project detected from the client's cwd,
-  proxied through a single service with one frontend port per compose service.
-
-  Exactly one project must be visible: enter a project directory to choose it.
-  Each service that declares a port is started and proxied on its published
-  port (or its target port when none is published): from its image when it
-  declares one, or by building its build context (with any build args) when
-  it declares a build instead. Services with neither are skipped.
+  The Compose project rooted at a workspace-root-relative path.
   """
-  startServices(ws: Workspace!): Service! @up {
-    let detected = projects(ws)
+  let projectAt(path: String!): ComposeProject! {
+    ComposeProject(path: path, compose: self)
+  }
+
+  """
+  The only Compose project visible from the client's cwd.
+  """
+  let single(ws: Workspace!): ComposeProject! {
+    let detected = tool.roots(ws, configNames)
     if (detected.length > 1) {
-      raise "multiple Compose projects detected ("
-        + detected.map { project => project.path }.join(", ")
+      raise "multiple Compose projects detected (" + detected.join(", ")
         + "); enter a project directory to choose one"
     }
-    let single = detected[0]
-    if (single == null) {
+    let only = detected[0]
+    if (only == null) {
       raise "no Compose project detected"
     } else {
-      single
-        .serviceSpecs(ws)
-        .filter { spec => (spec.image != "" or spec.buildContext != "") and spec.target != 0 }
-        .reduce(proxy) { front, spec =>
-          front.withService(
-            service: spec
-              .environment
-              .reduce(
-                if (spec.image != "") {
-                  container.from(spec.image)
-                } else {
-                  single.buildContextDir(ws, spec.buildContext).dockerBuild(
-                    buildArgs: spec.buildArgs.map { arg =>
-                      BuildArg(name: arg.name, value: arg.value)
-                    },
-                  )
-                },
-              ) { ctr, env => ctr.withEnvVariable(env.name, env.value) }
-              .withExposedPort(spec.target)
-              .asService(useEntrypoint: true)
-              .withHostname(spec.name),
-            name: spec.name,
-            frontend: if (spec.published == 0) { spec.target } else { spec.published },
-            backend: spec.target,
-          )
-        }
-        .service
+      projectAt(only ?? "")
     }
+  }
+}
+
+"""
+Compose projects in a workspace, keyed by the directory holding their Compose
+file.
+"""
+type ComposeProjects @collection {
+  """
+  Project root paths, relative to the workspace root.
+  """
+  paths: [String!]! @keys
+
+  let compose: Compose!
+
+  """
+  The Compose project rooted at path.
+  """
+  project(path: String!): ComposeProject! @get {
+    compose.projectAt(path)
   }
 
   """
-  Validate the Compose file of every project visible from the client's cwd. A
-  cwd holding no Compose file of its own sits inside its enclosing project, so
-  that project is validated too; enter a subproject to validate it alone.
+  Validate the Compose files of the selected projects.
   """
   lint(ws: Workspace!): Void @check {
-    let layers = projects(ws).map { project, i =>
-      directory.withFile(
-        toString(i) + "/" + project.configName(ws),
-        project.lintExec(ws).file(project.configName(ws)),
-      )
-    }.reduce(directory) { merged, layer => merged.withDirectory(".", layer) }
-    # FIXME: replace this when Dagger can directly run multiple containers in
-    # parallel. For now, merge one file from each project's lint container into
-    # a directory (keyed by project position, since a cwd-relative ".." path
-    # is not a valid directory name) and sync it to force every lint command
-    # to run.
-
-    layers.sync
+    # A selection over a list evaluates its elements concurrently, so every
+    # project is validated in parallel and every failure is reported.
+    let failures = paths.map { p => project(p) }.{{path, failure: lintFailure(ws)}}
+      .filter { r => r.failure != null }
+      .map { r => r.path + ": " + (r.failure ?? "") }
+    let failed = compose.tool.report(
+      "docker compose config failed",
+      paths.length,
+      "projects",
+      failures,
+    )
+    if (failed != null) {
+      raise failed ?? ""
+    }
     null
   }
 }
@@ -113,83 +101,242 @@ A Compose project rooted at a directory containing a Compose file.
 """
 type ComposeProject {
   """
-  Path of this project root, relative to the client's cwd. A ".." prefix
-  marks an enclosing project.
+  Project root, relative to the workspace root.
   """
   path: String!
 
-  """
-  Image providing the standalone Compose binary at /docker-compose.
-  """
-  let composeImage: String!
-
-  """
-  Filenames that mark a Compose project, in the order Compose itself prefers
-  them.
-  """
-  let configNames: [String!]!
+  let compose: Compose!
 
   """
   Filename of this project's Compose file, following Compose's own preference
   order when several are present.
   """
   let configName(ws: Workspace!): String! {
-    let present = ws.directory(path, include: configNames).glob("*")
-    let found = configNames.filter { name => present.contains(name) }[0]
+    let present = ws.directory(compose.tool.absolutePath(path), include: compose.configNames).glob("*")
+    let found = compose.configNames.filter { name => present.contains(name) }[0]
     if (found == null) {
       raise "no Compose file in " + path
     } else {
-      found
+      found ?? ""
     }
   }
 
   """
-  Cwd-relative path of this project's Compose file.
+  Workspace-root-relative path of this project's Compose file.
   """
   configPath(ws: Workspace!): String! {
     subpath(configName(ws))
   }
 
   """
-  Name of every service declared by this project's Compose file.
+  Services declared by this project's Compose file, keyed by service name.
+
+  Names are read from the file's top-level services mapping without running
+  Compose; a file that cannot be read this way lists no services.
   """
-  services(ws: Workspace!): [String!]! {
-    base(ws)
-      .withExec(["/docker-compose", "-f", configName(ws), "config", "--services"])
-      .stdout
-      .split("\n")
-      .filter { line => line != "" }
+  services(ws: Workspace!): ComposeServices! {
+    let empty: [String!]! = []
+    let names = {
+      parseServiceNames(ws.file(compose.tool.absolutePath(configPath(ws))).contents)
+    } rescue {
+      err: Error => empty
+    }
+    ComposeServices(names: compose.tool.sorted(names.uniq), project: self)
   }
 
   """
-  Name, image, build configuration, and first port mapping of every service
-  declared by this project's Compose file.
+  Validate this project's Compose file with 'docker compose config'.
   """
-  let serviceSpecs(ws: Workspace!): [ComposeService!]! {
+  lint(ws: Workspace!): Void @check {
+    let failure = lintFailure(ws)
+    if (failure != null) {
+      raise path + ": " + (failure ?? "")
+    }
+    null
+  }
+
+  """
+  Why 'docker compose config' rejected this project's Compose file, or null.
+  """
+  let lintFailure(ws: Workspace!): String {
+    let ran = base(ws).withExec(
+      ["/docker-compose", "-f", configName(ws), "config", "--quiet"],
+      expect: ReturnType.ANY,
+    )
+    let code = ran.exitCode
+    if (code == 0) {
+      null
+    } else {
+      let output = (ran.stderr + "\n" + ran.stdout).trimSpace.split("\n").takeLast(20).join("\n")
+      "docker compose config failed (exit " + toString(code) + ")"
+        + (if (output == "") { "" } else { ":\n" + output })
+    }
+  }
+
+  """
+  The service names declared under the top-level services key of Compose
+  file text, read line by line. Handles block and flow mappings, quoted keys
+  and comments; text it cannot read yields no names.
+  """
+  let parseServiceNames(text: String!): [String!]! {
+    let empty: [String!]! = []
+    let lines = text.split("\n").map { l => l.trimSuffix("\r") }
+    let starts = lines
+      .map { l, i => if (servicesValue(l) == null) { -1 } else { i } }
+      .filter { i => i >= 0 }
+    if (starts.length == 0) {
+      empty
+    } else {
+      let start = starts[0] ?? 0
+      # The services mapping runs until the next line that starts at column
+      # 0 with anything but a comment.
+      let body = lines.dropFirst(start + 1).takeWhile { l =>
+        l.trimSpace == "" or l.hasPrefix(" ") or l.hasPrefix("#")
+      }
+      let value = stripComment(servicesValue(lines[start] ?? "") ?? "")
+        .trimSpace
+        .rewriteMatches(`^&\S+\s*`) { m => "" }
+      let content = body.filter { l =>
+        l.trimSpace != "" and l.trimSpace.hasPrefix("#") == false
+      }
+      if (value.hasPrefix("{")) {
+        flowKeys(([value] + content.map { l => stripComment(l) }).join(" "))
+      } else if (value != "") {
+        # An alias or a scalar: nothing to read.
+        empty
+      } else {
+        let first = content[0] ?? ""
+        if (first.trimSpace.hasPrefix("{")) {
+          flowKeys(content.map { l => stripComment(l) }.join(" "))
+        } else {
+          let indent = indentOf(first)
+          content
+            .filter { l => indentOf(l) == indent }
+            .map { l => keyOf(l.trimSpace) }
+            .filter { k => k != "" }
+        }
+      }
+    }
+  }
+
+  """
+  The text after "services:" when line is the top-level services key, else
+  null.
+  """
+  let servicesValue(line: String!): String {
+    line.matchAll(`^(?:services|"services"|'services')\s*:(?:\s(.*))?$`).map { m =>
+      m.captures[0] ?? ""
+    }[0]
+  }
+
+  """
+  line without a trailing comment.
+  """
+  let stripComment(line: String!): String! {
+    line.rewriteMatches(`(?:^|\s)#.*$`) { m => "" }
+  }
+
+  """
+  The number of spaces line is indented by.
+  """
+  let indentOf(line: String!): Int! {
+    line.split("").takeWhile { c => c == " " }.length
+  }
+
+  """
+  The key of a block mapping entry, or "" when entry is not one: plain,
+  'single-quoted' and "double-quoted" keys are read; sequence items, merge
+  keys and complex keys are not.
+  """
+  let keyOf(entry: String!): String! {
+    if (entry.hasPrefix("\"")) {
+      entry.matchAll(`^"((?:[^"\\]|\\.)*)"\s*:(?:\s|$)`).map { m => m.captures[0] ?? "" }[0] ?? ""
+    } else if (entry.hasPrefix("'")) {
+      (entry.matchAll(`^'((?:[^']|'')*)'\s*:(?:\s|$)`).map { m => m.captures[0] ?? "" }[0] ?? "")
+        .replace("''", "'")
+    } else if (entry == "-" or entry.hasPrefix("- ") or entry.hasPrefix("? ") or entry.hasPrefix("<<")) {
+      ""
+    } else {
+      entry.matchAll(`^([^\s#'"\[\]{},&*!|>%@][^#]*?)\s*:(?:\s|$)`).map { m => m.captures[0] ?? "" }[0]
+        ?? ""
+    }
+  }
+
+  """
+  The top-level keys of a flow mapping such as {web: {image: nginx}, db: {}}.
+  """
+  let flowKeys(text: String!): [String!]! {
+    let inner = text.trimSpace.trimPrefix("{").split("}").dropLast(1).join("}")
+    # Drop nested mappings and sequences, innermost first, so only the
+    # top-level entries remain.
+    let flat = [1, 2, 3, 4, 5, 6, 7, 8].reduce(inner) { acc, pass =>
+      acc.rewriteMatches(`\{[^{}]*\}|\[[^\[\]]*\]`) { m => "" }
+    }
+    flat.split(",").map { e => keyOf(e.trimSpace) }.filter { k => k != "" }
+  }
+
+  """
+  Name, image, build configuration, environment and first port mapping of
+  every service declared by this project's Compose file, as resolved by
+  'docker compose config'. Services behind a profile are included only with
+  allProfiles.
+  """
+  let serviceSpecs(ws: Workspace!, allProfiles: Boolean! = false): [ComposeServiceSpec!]! {
     # The compose JSON keys services (and build args) by name, which
-    # type-driven fromJSON can't parse; jq flattens both to fixed shapes first.
+    # type-driven JSON.decode can't parse; jq flattens both to fixed shapes first.
     let specs = container
       .from("docker.io/library/alpine:3.20")
       .withExec(["apk", "add", "--no-cache", "jq"])
-      .withFile("/usr/local/bin/docker-compose", container.from(composeImage).file("/docker-compose"))
+      .withFile(
+        "/usr/local/bin/docker-compose",
+        container.from(compose.composeImage).file("/docker-compose"),
+      )
       .withWorkdir("/src")
-      .withDirectory(".", ws.directory(path))
+      .withDirectory(".", projectDir(ws))
       .withExec([
         "sh",
         "-c",
-        "docker-compose -f " + configName(ws) + " config --format json | "
+        "docker-compose -f " + configName(ws)
+          + (if (allProfiles) { " --profile '*'" } else { "" })
+          + " config --format json | "
           + "jq -c '[.services | to_entries[] | {name: .key, "
           + "image: (.value.image // \"\"), "
           + "target: (.value.ports[0].target // 0), "
           + "published: ((.value.ports[0].published // \"0\") | tonumber), "
           + "buildContext: (.value.build.context // \"\"), "
+          + "buildDockerfile: (.value.build.dockerfile // \"\"), "
+          + "buildTarget: (.value.build.target // \"\"), "
           + "buildArgs: ((.value.build.args // {}) | to_entries | "
           + "map({name: .key, value: (.value // \"\")})), "
           + "environment: ((.value.environment // {}) | to_entries | "
           + "map({name: .key, value: (.value // \"\")}))}]'",
       ])
       .stdout
-    fromJSON(specs)
+    JSON.decode(specs)
+  }
+
+  """
+  The specs of the named services, in the order given, whatever their
+  profiles. Raises for a name 'docker compose config' does not know.
+  """
+  let specsNamed(ws: Workspace!, names: [String!]!): [ComposeServiceSpec!]! {
+    let specs = serviceSpecs(ws, allProfiles: true)
+    names.map { n =>
+      let found = specs.filter { spec => spec.name == n }[0]
+      if (found == null) {
+        raise "service " + n + " is not in the resolved configuration of " + configPath(ws)
+      } else {
+        found
+      }
+    }
+  }
+
+  """
+  The specs of the named services that Compose starts by default: services
+  behind a profile, and names it does not know, are left out.
+  """
+  let activeSpecs(ws: Workspace!, names: [String!]!): [ComposeServiceSpec!]! {
+    serviceSpecs(ws).filter { spec => names.contains(spec.name) }
   }
 
   """
@@ -198,34 +345,105 @@ type ComposeProject {
   the compose container, where the project is mounted at /src.
   """
   let buildContextDir(ws: Workspace!, context: String!): Directory! {
-    let relative = context.trimPrefix("/src").trimPrefix("/")
-    ws.directory(if (relative == "") { path } else { subpath(relative) })
-  }
-
-  """
-  Return a cwd-relative path for a project-relative subpath.
-  """
-  let subpath(relativePath: String!): String! {
-    if (path == ".") {
-      relativePath
+    if (context == "/src") {
+      projectDir(ws)
+    } else if (context.hasPrefix("/src/")) {
+      ws.directory(
+        compose.tool.absolutePath(subpath(context.trimPrefix("/src/"))),
+      )
     } else {
-      path.trimSuffix("/") + "/" + relativePath
+      raise "unsupported build context " + context
+        + ": only directories inside the Compose project can be built"
     }
   }
 
   """
-  Validate this project's Compose file with 'docker compose config'.
+  The image a service with a build context builds.
   """
-  lint(ws: Workspace!): Void @check {
-    lintExec(ws).sync
-    null
+  let buildImage(ws: Workspace!, spec: ComposeServiceSpec!): Container! {
+    let dockerfile = spec.buildDockerfile.trimPrefix(spec.buildContext + "/")
+    buildContextDir(ws, spec.buildContext).dockerBuild(
+      dockerfile: if (dockerfile == "") { "Dockerfile" } else { dockerfile },
+      target: spec.buildTarget,
+      buildArgs: spec.buildArgs.map { arg => BuildArg(name: arg.name, value: arg.value) },
+    )
   }
 
   """
-  Container synced by this project's lint check.
+  The container a service runs: its image when it declares one, else the
+  image its build context builds, with its environment set.
   """
-  let lintExec(ws: Workspace!): Container! {
-    base(ws).withExec(["/docker-compose", "-f", configName(ws), "config", "--quiet"])
+  let serviceContainer(ws: Workspace!, spec: ComposeServiceSpec!): Container! {
+    spec
+      .environment
+      .reduce(
+        if (spec.image != "") { container.from(spec.image) } else {
+          buildImage(
+            ws,
+            spec,
+          )
+        },
+      ) { ctr, env => ctr.withEnvVariable(env.name, env.value) }
+  }
+
+  """
+  The services of specs that can run and declare a port, proxied through a
+  single service with one frontend port per service: its published port, or
+  its target port when none is published.
+  """
+  let proxied(ws: Workspace!, specs: [ComposeServiceSpec!]!): Service! {
+    let runnable = specs.filter { spec =>
+      (spec.image != "" or spec.buildContext != "") and spec.target != 0
+    }
+    if (runnable.length == 0) {
+      raise "nothing to start in " + configPath(ws) + ": no selected service declares a port"
+    }
+    runnable
+      .reduce(proxy) { front, spec =>
+        front.withService(
+          service: serviceContainer(ws, spec)
+            .withExposedPort(spec.target)
+            .asService(useEntrypoint: true)
+            .withHostname(spec.name),
+          name: spec.name,
+          frontend: if (spec.published == 0) { spec.target } else { spec.published },
+          backend: spec.target,
+        )
+      }
+      .service
+  }
+
+  """
+  The module's composeBase, with composeEnvs set, and the services of specs
+  that can run bound to it by name.
+  """
+  let inject(ws: Workspace!, specs: [ComposeServiceSpec!]!): Container! {
+    specs
+      .filter { spec => spec.image != "" or spec.buildContext != "" }
+      .reduce(compose.tool.composeBaseWithEnvs) { ctr, spec =>
+        let built = serviceContainer(ws, spec)
+        let exposed = if (spec.target == 0) { built } else {
+          built.withExposedPort(spec.target)
+        }
+        ctr.withServiceBinding(
+          spec.name,
+          exposed.asService(useEntrypoint: true).withHostname(spec.name),
+        )
+      }
+  }
+
+  """
+  This project's directory.
+  """
+  let projectDir(ws: Workspace!): Directory! {
+    ws.directory(compose.tool.absolutePath(path))
+  }
+
+  """
+  Return a workspace-root-relative path for a project-relative subpath.
+  """
+  let subpath(relativePath: String!): String! {
+    if (path == ".") { relativePath } else { path + "/" + relativePath }
   }
 
   """
@@ -235,9 +453,64 @@ type ComposeProject {
   """
   let base(ws: Workspace!): Container! {
     container
-      .from(composeImage)
+      .from(compose.composeImage)
       .withWorkdir("/src")
-      .withDirectory(".", ws.directory(path))
+      .withDirectory(".", projectDir(ws))
+  }
+}
+
+"""
+Services of a Compose project, keyed by service name.
+"""
+type ComposeServices @collection {
+  """
+  Service names.
+  """
+  names: [String!]! @keys
+
+  let project: ComposeProject!
+
+  """
+  The Compose service with this name.
+  """
+  service(name: String!): ComposeService! @get {
+    ComposeService(name: name, project: project)
+  }
+
+  """
+  Build the images of the selected services that declare a build.
+  """
+  build(ws: Workspace!): Void @check {
+    let failures = names.map { n => service(n) }.{{name, failure: buildFailure(ws)}}
+      .filter { r => r.failure != null }
+      .map { r => project.path + " (service " + r.name + "): " + (r.failure ?? "") }
+    let failed = project.compose.tool.report(
+      "docker build failed",
+      names.length,
+      "services",
+      failures,
+    )
+    if (failed != null) {
+      raise failed ?? ""
+    }
+    null
+  }
+
+  """
+  Run the selected services that declare a port, proxied through a single
+  service with one frontend port per service. Services behind a profile are
+  not started.
+  """
+  up(ws: Workspace!): Service! {
+    project.proxied(ws, project.activeSpecs(ws, names))
+  }
+
+  """
+  The module's composeBase with the selected services bound to it by name.
+  Services behind a profile are not bound.
+  """
+  injectServices(ws: Workspace!): Container! {
+    project.inject(ws, project.activeSpecs(ws, names))
   }
 }
 
@@ -245,6 +518,69 @@ type ComposeProject {
 A service declared by a Compose project's Compose file.
 """
 type ComposeService {
+  """
+  Service name.
+  """
+  name: String!
+
+  let project: ComposeProject!
+
+  """
+  The container this service runs: its image, or the image its build
+  context builds, with its environment set.
+  """
+  container(ws: Workspace!): Container! {
+    project.serviceContainer(ws, spec(ws))
+  }
+
+  """
+  Build this service's image, if it declares a build.
+  """
+  build(ws: Workspace!): Void @check {
+    let failure = buildFailure(ws)
+    if (failure != null) {
+      raise project.path + " (service " + name + "): " + (failure ?? "")
+    }
+    null
+  }
+
+  """
+  Why building this service's image failed, or null. A service without a
+  build has nothing to build.
+  """
+  let buildFailure(ws: Workspace!): String {
+    {
+      let found = spec(ws)
+      if (found.buildContext == "") {
+        null
+      } else {
+        project.compose.tool.stepFailure("docker build failed", project.buildImage(
+          ws,
+          found,
+        ))
+      }
+    } rescue {
+      err: Error => "could not resolve the service: " + err.message
+    }
+  }
+
+  """
+  This service's resolved configuration.
+  """
+  let spec(ws: Workspace!): ComposeServiceSpec! {
+    let found = project.specsNamed(ws, [name])[0]
+    if (found == null) {
+      raise "service " + name + " not found"
+    } else {
+      found
+    }
+  }
+}
+
+"""
+A service's configuration as resolved by 'docker compose config'.
+"""
+type ComposeServiceSpec {
   """
   Service name.
   """
@@ -271,6 +607,17 @@ type ComposeService {
   service runs an image.
   """
   buildContext: String! = ""
+
+  """
+  Dockerfile of the service's build, relative to its context. Empty for the
+  default Dockerfile.
+  """
+  buildDockerfile: String! = ""
+
+  """
+  Target stage of the service's build. Empty for the final stage.
+  """
+  buildTarget: String! = ""
 
   """
   Args of the service's build configuration.

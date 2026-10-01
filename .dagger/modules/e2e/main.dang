@@ -423,6 +423,10 @@ type E2e {
           "    image: traefik/whoami:v1.11",
           "    environment:",
           "      WHOAMI_PORT_NUMBER: \"80\"",
+          "  sleeper:",
+          "    image: alpine:3.20",
+          "    entrypoint: [sleep]",
+          "    command: [\"300\"]",
           "  debug:",
           "    image: traefik/whoami:v1.11",
           "    profiles: [debug]",
@@ -437,8 +441,8 @@ type E2e {
   """
   injectServices binds the selected services to composeBase by name, with
   composeEnvs set; the top-level injectServices binds every service of the
-  single project in the working directory. Services behind a profile are
-  left out.
+  single project in the working directory, running each with its entrypoint
+  and command. Services behind a profile are left out.
   """
   injectCheck: Void @check {
     let tool = docker(
@@ -460,7 +464,7 @@ type E2e {
 
     let all = tool.injectServices(ws.withWorkdir("svc"))
     let both = all
-      .withExec(["sh", "-c", "wget -qO- http://other:80 | grep -q Hostname && getent hosts quiet >/dev/null && ! getent hosts debug && echo ok"])
+      .withExec(["sh", "-c", "wget -qO- http://other:80 | grep -q Hostname && getent hosts quiet >/dev/null && getent hosts sleeper >/dev/null && ! getent hosts debug && echo ok"])
       .stdout
     assert(both.trimSpace == "ok", "top-level injection: " + both)
 

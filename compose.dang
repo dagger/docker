@@ -301,6 +301,8 @@ type ComposeProject {
           + " config --format json | "
           + "jq -c '[.services | to_entries[] | {name: .key, "
           + "image: (.value.image // \"\"), "
+          + "entrypoint: (.value.entrypoint // []), "
+          + "command: (.value.command // []), "
           + "target: (.value.ports[0].target // 0), "
           + "published: ((.value.ports[0].published // \"0\") | tonumber), "
           + "buildContext: (.value.build.context // \"\"), "
@@ -371,19 +373,26 @@ type ComposeProject {
 
   """
   The container a service runs: its image when it declares one, else the
-  image its build context builds, with its environment set.
+  image its build context builds, with its entrypoint, command and
+  environment set.
   """
   let serviceContainer(ws: Workspace!, spec: ComposeServiceSpec!): Container! {
-    spec
-      .environment
-      .reduce(
-        if (spec.image != "") { container.from(spec.image) } else {
-          buildImage(
-            ws,
-            spec,
-          )
-        },
-      ) { ctr, env => ctr.withEnvVariable(env.name, env.value) }
+    let image = if (spec.image != "") {
+      container.from(spec.image)
+    } else {
+      buildImage(ws, spec)
+    }
+    let entry = if (spec.entrypoint.length > 0) {
+      image.withEntrypoint(spec.entrypoint)
+    } else {
+      image
+    }
+    let cmd = if (spec.command.length > 0) {
+      entry.withDefaultArgs(spec.command)
+    } else {
+      entry
+    }
+    spec.environment.reduce(cmd) { ctr, env => ctr.withEnvVariable(env.name, env.value) }
   }
 
   """
@@ -601,6 +610,17 @@ type ComposeServiceSpec {
   published.
   """
   published: Int! = 0
+
+  """
+  Entrypoint the service overrides its image's with. Empty to keep the
+  image's.
+  """
+  entrypoint: [String!]! = []
+
+  """
+  Command the service overrides its image's with. Empty to keep the image's.
+  """
+  command: [String!]! = []
 
   """
   Build context as resolved by 'docker compose config'. Empty when the

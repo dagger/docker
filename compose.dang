@@ -489,9 +489,13 @@ type DockerComposeProject {
   TCP port they publish (their target port when none is published), as raw
   TCP. Services without a published port run behind it too.
   """
-  let proxied(ws: Workspace!, specs: [ComposeServiceSpec!]!): Service! {
+  let proxied(ws: Workspace!, specs: [ComposeServiceSpec!]!, selected: [String!]! = []): Service! {
     let running = started(ws, specs)
-    let front = running.reduce(proxy) { f, r =>
+    # The selected services' ports come first, so a consumer that takes the
+    # first exposed port reaches what was asked for, not a dependency.
+    let ordered = running.filter { r => selected.contains(r.name) }
+      + running.filter { r => selected.contains(r.name) == false }
+    let front = ordered.reduce(proxy) { f, r =>
       r.ports.reduce(f) { g, p =>
         g.withService(
           service: r.service,
@@ -561,10 +565,12 @@ type DockerComposeProject {
   user, working directory, mounts, secrets and configs.
   """
   let serviceContainer(ws: Workspace!, spec: ComposeServiceSpec!): Container! {
-    let image = if (spec.image != "") {
-      container.from(spec.image)
-    } else {
+    # Like Compose, a service with a build context builds it; image only
+    # names the result.
+    let image = if (spec.buildContext != "") {
       buildImage(ws, spec)
+    } else {
+      container.from(spec.image)
     }
     let entry = if (spec.entrypoint.length > 0) {
       image.withEntrypoint(spec.entrypoint)
@@ -705,7 +711,7 @@ type DockerComposeServices @collection {
   started.
   """
   up(ws: Workspace!): Service! {
-    project.proxied(ws, project.activeSpecs(ws, names))
+    project.proxied(ws, project.activeSpecs(ws, names), selected: names)
   }
 
   """
@@ -742,6 +748,14 @@ type DockerComposeService {
   """
   warnings(ws: Workspace!): [String!]! {
     spec(ws).warnings
+  }
+
+  """
+  Run this service and the services it depends on, behind one proxy that
+  publishes their TCP ports, this service's first.
+  """
+  up(ws: Workspace!): Service! {
+    project.proxied(ws, project.activeSpecs(ws, [name]), selected: [name])
   }
 
   """

@@ -206,9 +206,13 @@ arguments come from the `lintArgs` setting, for example
   a published port is published on its target port. Two services can't
   publish the same port, as with Compose. UDP ports are not published (see
   the warnings below). Ports from `ports` and `expose` are what Dagger waits
-  for before starting dependents.
-- **Container:** each service runs its image, or the image its build context
-  builds. Compose's entrypoint, command, environment (including `env_file`),
+  for before starting dependents. The selected services' ports come first,
+  then their dependencies', so a consumer that takes a service's first port
+  (such as the Playwright module's `PLAYWRIGHT_BASE_URL`) reaches the service
+  you selected, not its database.
+- **Container:** each service builds its build context when it declares one,
+  as Compose does, even when it also names an `image` (which only names the
+  result); otherwise it runs its image. Compose's entrypoint, command, environment (including `env_file`),
   user, working directory and `privileged` are applied.
 - **Mounts:**
   - bind mounts of files or directories inside the workspace are mounted as
@@ -248,7 +252,20 @@ Not reproduced, and not warned about:
 ```sh
 dagger up -l                                # what dagger up would start
 dagger up --docker-compose-project=svc      # the services of one project
+dagger up --docker-compose-project=svc --docker-compose-service=web  # web and its dependencies
 ```
+
+`up` is on the services collection (every service of a project) and on each
+service (that service and what it `depends_on`), so a DAG link can name
+either. That makes one service wireable into another module's `Service`
+setting:
+
+```toml
+[modules.playwright.settings]
+service = "dag://docker/compose/projects/services/up?docker-compose-project=e2e&docker-compose-service=web"
+```
+
+`dagger list services -a -f link` prints every such link.
 
 A bare `dagger up` starts every service in the workspace, including this
 module's `engine` functions (Docker-in-Docker), so select the Compose
@@ -267,8 +284,8 @@ dagger settings docker composeBase alpine:3.20
 cd svc && dagger call docker inject-services with-exec --args sh,-c,'getent hosts web' stdout
 ```
 
-To run or bind only some services, use `up` or `injectServices` on a subset
-of the services collection from another module (below).
+To bind only some services, use `injectServices` on a subset of the services
+collection from another module (below).
 
 ## Using it from another module
 
@@ -287,6 +304,7 @@ projects.get(key: "app").container(ws, target: "test")  # the built image
 let services = docker.compose.projects(ws).get(key: "svc").services(ws)
 services.subset(keys: ["web", "db"]).batch.up(ws)    # a Service
 services.subset(keys: ["db"]).batch.injectServices(ws)  # a Container
+services.get(key: "web").up(ws)                      # web and its dependencies
 services.get(key: "web").warnings(ws)                # what up can't reproduce
 ```
 

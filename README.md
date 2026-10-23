@@ -71,6 +71,25 @@ and runners call `docker compose` in the project directory without `-f`, so
 Compose picks and merges the files itself (including `COMPOSE_FILE` from a
 `.env` file).
 
+To use other file names, set `composeFiles`, as you would pass `-f`:
+
+```toml
+settings.composeFiles = ["testing-docker-compose.yml", "testing-docker-compose.ci.yml"]
+```
+
+Then the standard names are not used at all:
+
+- a directory holding the first file is a Compose project, and its key;
+- the files present in it are merged in the order given, and later files
+  may be missing;
+- no override file is merged, as with `-f`;
+- every `docker compose` run gets one `-f` per file, so a `docker-compose.yml`
+  next to them, and `COMPOSE_FILE`, are ignored.
+
+The setting applies to every project, so a directory with both a
+`docker-compose.yml` and a `testing-docker-compose.yml` uses only the test
+stack. Entries are file names, not paths.
+
 Service names are read from the top-level `services` mapping of the Compose
 file and its override file, without running Compose. The parser understands:
 
@@ -80,8 +99,8 @@ file and its override file, without running Compose. The parser understands:
 
 It does not see:
 
-- services pulled in with `include:`, or from files named by `-f` or
-  `COMPOSE_FILE`;
+- services pulled in with `include:`, or from files named by `COMPOSE_FILE`
+  (set `composeFiles` instead);
 - services merged in with YAML anchors and merge keys (`<<: *base`) at the
   `services` level, or a `services:` mapping given as an alias;
 - environment interpolation in service names.
@@ -225,6 +244,21 @@ arguments come from the `lintArgs` setting, for example
   - `tmpfs` mounts become temporary directories;
   - file-based secrets and configs are mounted at their targets
     (`/run/secrets/<name>` by default).
+- **Host gateway:** when the `hostGateway` setting names a service, a
+  Compose service reaches it under every name its `extra_hosts` maps to
+  `host-gateway`. To let services call back into a process on your machine,
+  such as a test run, point it at that process's port:
+
+  ```toml
+  settings.hostGateway = "tcp://localhost:8080"
+  ```
+
+  With `extra_hosts: ["host.docker.internal:host-gateway"]`, the service
+  then reaches the process at `host.docker.internal:8080`. A host service
+  forwards only the ports it names, unlike Docker's gateway. When the run
+  ends, the trace may show services bound to it as failed, because the host
+  tunnel stops first; the run itself succeeds. The process must be outside
+  Dagger, because Dagger can't bind a service that binds it back.
 - **Profiles:** services behind a profile are not started.
 
 What it can't reproduce is printed as a warning in the trace, per service,
@@ -236,9 +270,12 @@ is available as `warnings` on a service:
   missing bind sources;
 - secrets and configs from the environment or external;
 - other mount types;
-- `cap_add`, `cap_drop`, `devices`, `dns`, `deploy`, `extra_hosts`, `init`,
-  `ipc`, `network_mode`, `pid`, `platform`, `runtime`, `security_opt`,
-  `shm_size`, `stop_signal`, `sysctls`, `tmpfs` and `ulimits`.
+- `extra_hosts` entries with a fixed address, `localhost:host-gateway`
+  (localhost stays the service's own loopback), and every `host-gateway`
+  entry while `hostGateway` is unset;
+- `cap_add`, `cap_drop`, `devices`, `dns`, `deploy`, `init`, `ipc`,
+  `network_mode`, `pid`, `platform`, `runtime`, `security_opt`, `shm_size`,
+  `stop_signal`, `sysctls`, `tmpfs` and `ulimits`.
 
 Not reproduced, and not warned about:
 
@@ -349,6 +386,8 @@ settings.lintImage = "docker.io/hadolint/hadolint:v2.14.0-alpine"  # the default
 settings.lintArgs = ["--failure-threshold", "warning"]  # default: []; extra hadolint arguments
 settings.buildTarget = "production"            # default: ""; stage the project build builds where declared
 settings.composeImage = "docker.io/docker/compose-bin:v5.5.0"  # the default; provides /docker-compose
+settings.composeFiles = ["testing-docker-compose.yml"]  # default: []; Compose file names to use, as with -f
+settings.hostGateway = "tcp://localhost:8080"  # default: unset; what extra_hosts' host-gateway entries reach
 settings.composeBase = "alpine:3.20"           # default: an empty container; what injectServices binds services to
 settings.composeEnvs = ["LOG_LEVEL=debug"]     # default: []; KEY=VALUE set on composeBase
 ```

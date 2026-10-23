@@ -28,11 +28,31 @@ type Compose {
   ]
 
   """
+  The composeFiles setting, checked to hold file names only.
+  """
+  let customNames: [String!]! {
+    let paths = tool.composeFiles.filter { n => n.contains("/") or n == "" }
+    if (paths.length > 0) {
+      raise "composeFiles takes file names, not paths: " + paths.join(", ")
+    }
+    tool.composeFiles
+  }
+
+  """
+  File names that mark a Compose project: the first of the composeFiles
+  setting when it is set, else configNames.
+  """
+  let markers: [String!]! {
+    let first = customNames[0]
+    if (first == null) { configNames } else { [first ?? ""] }
+  }
+
+  """
   Compose projects at or below the working directory, keyed by the directory
   holding their Compose file.
   """
   projects(ws: Workspace!): DockerComposeProjects! {
-    DockerComposeProjects(paths: tool.roots(ws, configNames), compose: self)
+    DockerComposeProjects(paths: tool.roots(ws, markers), compose: self)
   }
 
   """
@@ -46,7 +66,7 @@ type Compose {
   The only Compose project visible from the client's cwd.
   """
   let single(ws: Workspace!): DockerComposeProject! {
-    let detected = tool.roots(ws, configNames)
+    let detected = tool.roots(ws, markers)
     if (detected.length > 1) {
       raise "multiple Compose projects detected (" + detected.join(", ")
         + "); enter a project directory to choose one"
@@ -125,37 +145,71 @@ type DockerComposeProject {
   """
   let presentFiles(ws: Workspace!): [String!]! {
     ws
-      .directory(compose.tool.absolutePath(path), include: compose.configNames + compose.overrideNames)
+      .directory(
+        compose.tool.absolutePath(path),
+        include: compose.configNames + compose.overrideNames + compose.customNames,
+      )
       .glob("*")
   }
 
   """
-  This project's Compose file and, when there is one, its override file,
-  workspace-root-relative.
+  Names of this project's Compose files, in the order Compose merges them:
+  the files of the composeFiles setting present in the directory when it is
+  set, else the Compose file and, when there is one, its override file.
+  """
+  let fileNames(ws: Workspace!): [String!]! {
+    let present = presentFiles(ws)
+    let empty: [String!]! = []
+    if (compose.customNames.length > 0) {
+      let names = compose.customNames.filter { n => present.contains(n) }
+      if (present.contains(compose.customNames[0] ?? "") == false) {
+        raise "no " + (compose.customNames[0] ?? "") + " in " + path
+      }
+      names
+    } else {
+      let config = firstPresent(present, compose.configNames)
+      let override = firstPresent(present, compose.overrideNames)
+      if (config == null) {
+        raise "no Compose file in " + path
+      }
+      [config ?? ""] + (if (override == null) { empty } else { [override ?? ""] })
+    }
+  }
+
+  """
+  This project's Compose files, workspace-root-relative, in the order
+  Compose merges them.
   """
   let composeFiles(ws: Workspace!): [String!]! {
-    let present = presentFiles(ws)
-    let config = firstPresent(present, compose.configNames)
-    let override = firstPresent(present, compose.overrideNames)
-    if (config == null) {
-      raise "no Compose file in " + path
-    }
+    fileNames(ws).map { n => subpath(n) }
+  }
+
+  """
+  The -f arguments Compose runs with: one per file when the composeFiles
+  setting is set, else none, so Compose picks the files itself.
+  """
+  let fileArgs(ws: Workspace!): [String!]! {
     let empty: [String!]! = []
-    [subpath(config ?? "")] + (if (override == null) { empty } else { [subpath(override ?? "")] })
+    if (compose.customNames.length == 0) {
+      empty
+    } else {
+      fileNames(ws).reduce(empty) { acc, n => acc + ["-f", n] }
+    }
   }
 
   """
   Workspace-root-relative path of this project's Compose file: the first of
   compose.yaml, compose.yml, docker-compose.yml and docker-compose.yaml, as
-  Compose picks it.
+  Compose picks it, or the first of the composeFiles setting.
   """
   configPath(ws: Workspace!): String! {
     composeFiles(ws)[0] ?? ""
   }
 
   """
-  Workspace-root-relative path of the override file Compose merges over the
-  Compose file (compose.override.yml and its variants), or null.
+  Workspace-root-relative path of the file Compose merges over the Compose
+  file (compose.override.yml and its variants, or the second of the
+  composeFiles setting), or null.
   """
   overridePath(ws: Workspace!): String {
     composeFiles(ws)[1]
@@ -200,7 +254,7 @@ type DockerComposeProject {
       .from(compose.tool.composeImage)
       .withDirectory(mountPath, projectDir(ws))
       .withWorkdir(mountPath)
-      .withExec(["/docker-compose", "config", "--quiet"], expect: ReturnType.ANY)
+      .withExec(["/docker-compose"] + fileArgs(ws) + ["config", "--quiet"], expect: ReturnType.ANY)
     let code = ran.exitCode
     if (code == 0) {
       null
@@ -332,6 +386,8 @@ type DockerComposeProject {
     def wspath: if . == "/ws" then "." elif startswith("/ws/") then .[4:] else null end;
     def kv: to_entries | map({name: .key, value: ((.value // "") | tostring)});
     def inside: ((. // "") | wspath) != null;
+    def gateway: endswith("=host-gateway") and . != "localhost=host-gateway";
+    def hostentry: sub("="; ":");
     . as $root
     | [(.services // {}) | to_entries[] | .key as $name | .value as $s | {
         name: $name,
@@ -359,7 +415,8 @@ type DockerComposeProject {
           + [($s.configs // [])[] | select($root.configs[.source].file | inside)
             | {source: ($root.configs[.source].file | wspath),
                target: (if (.target // "") == "" then "/" + .source elif (.target | startswith("/")) then .target else "/" + .target end)}]),
-        warnings: ([($s.ports // [])[] | select((.protocol // "tcp") != "tcp")
+        hostGateway: [($s.extra_hosts // [])[] | select(gateway) | sub("=host-gateway$"; "")],
+        warnings:([($s.ports // [])[] | select((.protocol // "tcp") != "tcp")
             | "port \(.published // "")->\(.target)/\(.protocol) is not published: only TCP ports are"]
           + [($s.expose // [])[] | tostring | select(test("^[0-9]+(/tcp)?$") | not)
             | "expose \(.) is ignored: only single TCP ports are"]
@@ -371,7 +428,13 @@ type DockerComposeProject {
             | "secret \(.source) is not mounted: only secrets from files in the workspace are"]
           + [($s.configs // [])[] | select($root.configs[.source].file | inside | not)
             | "config \(.source) is not mounted: only configs from files in the workspace are"]
-          + [$s | keys[] | select(IN("cap_add", "cap_drop", "devices", "dns", "deploy", "extra_hosts", "init",
+          + [($s.extra_hosts // [])[] | select(endswith("=host-gateway") | not)
+            | "extra_hosts \(hostentry) is ignored: only host-gateway entries are"]
+          + [($s.extra_hosts // [])[] | select(. == "localhost=host-gateway")
+            | "extra_hosts \(hostentry) is ignored: localhost stays the service's own loopback"]
+          + (if $gateway then [] else [($s.extra_hosts // [])[] | select(gateway)
+            | "extra_hosts \(hostentry) is ignored: set hostGateway to reach the host"] end)
+          + [$s | keys[] | select(IN("cap_add", "cap_drop", "devices", "dns", "deploy", "init",
               "ipc", "network_mode", "pid", "platform", "runtime", "security_opt", "shm_size", "stop_signal",
               "sysctls", "tmpfs", "ulimits"))
             | "\(.) is ignored"])
@@ -387,6 +450,7 @@ type DockerComposeProject {
   let serviceSpecs(ws: Workspace!, allProfiles: Boolean! = false): [ComposeServiceSpec!]! {
     # The compose JSON keys services (and build args) by name, which
     # type-driven JSON.decode can't parse; jq flattens them first.
+    let profiles: [String!]! = if (allProfiles) { ["--profile", "*"] } else { [] }
     let specs = container
       .from("docker.io/library/alpine:3.20")
       .withExec(["apk", "add", "--no-cache", "jq"])
@@ -397,11 +461,19 @@ type DockerComposeProject {
       .withNewFile("/spec.jq", specFilter)
       .withDirectory(mountPath, projectDir(ws))
       .withWorkdir(mountPath)
+      .withExec(
+        ["docker-compose"] + fileArgs(ws) + profiles + ["config", "--format", "json"],
+        redirectStdout: "/config.json",
+      )
       .withExec([
-        "sh",
+        "jq",
         "-c",
-        "docker-compose" + (if (allProfiles) { " --profile '*'" } else { "" })
-          + " config --format json | jq -c -f /spec.jq",
+        "--argjson",
+        "gateway",
+        if (compose.tool.hostGateway == null) { "false" } else { "true" },
+        "-f",
+        "/spec.jq",
+        "/config.json",
       ])
       .stdout
     JSON.decode(specs)
@@ -472,8 +544,14 @@ type DockerComposeProject {
     startOrder(specs).reduce(empty) { running, name =>
       specs.filter { s => s.name == name }.reduce(running) { acc, spec =>
         spec.warnings.each { w => print("warning: " + path + " (service " + spec.name + "): " + w) }
-        let bound = acc.reduce(serviceContainer(ws, spec)) { c, peer =>
+        let peers = acc.reduce(serviceContainer(ws, spec)) { c, peer =>
           c.withServiceBinding(peer.name, peer.service)
+        }
+        let gateway = compose.tool.hostGateway
+        let bound = if (gateway == null) {
+          peers
+        } else {
+          spec.hostGateway.reduce(peers) { c, host => c.withServiceBinding(host, gateway) }
         }
         let ports = (spec.ports.map { p => p.target } + spec.expose).uniq
         let exposed = ports.reduce(bound) { c, port => c.withExposedPort(port) }
@@ -912,6 +990,11 @@ type ComposeServiceSpec {
   Secrets and configs read from files in the workspace.
   """
   files: [ComposeFileMount!]! = []
+
+  """
+  Host names extra_hosts maps to host-gateway, other than localhost.
+  """
+  hostGateway: [String!]! = []
 
   """
   What up and injectServices can't reproduce for this service.

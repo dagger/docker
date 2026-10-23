@@ -506,9 +506,12 @@ type E2e {
   }
 
   """
-  A Compose project in the style of nginx-golang: web publishes two ports,
+  A Compose project in the style of nginx-golang: site publishes two ports,
   reads its config and site from bind mounts and a secret from a file, and
   reaches api, which publishes nothing and is started as its dependency.
+
+  Service hostnames are session-wide and checks run concurrently, so its
+  service names must not appear in another fixture whose services start.
   """
   let stack: Workspace! {
     directory
@@ -519,7 +522,7 @@ type E2e {
           "  token:",
           "    file: ./token.txt",
           "services:",
-          "  web:",
+          "  site:",
           "    image: nginx:1.25.3",
           "    ports:",
           "      - \"18091:80\"",
@@ -584,7 +587,7 @@ type E2e {
   upStackCheck: Void @check {
     let ws = stack
     let services = docker.compose.projects(ws).get(key: "stack").services(ws)
-    let front = services.subset(keys: ["web", "seeded"]).batch.up(ws)
+    let front = services.subset(keys: ["site", "seeded"]).batch.up(ws)
     let ports = front.ports.{{port}}.map { p => toString(p.port) }
     assert(same(ports, ["18095", "18091", "18092", "18094", "80"]), "published ports: " + ports.join(", "))
     let out = container
@@ -619,7 +622,7 @@ type E2e {
       .stdout
     assert(written == "nobody\nok\n", "a non-root service could not write its volumes: " + written)
 
-    let warnings = services.get(key: "web").warnings(ws)
+    let warnings = services.get(key: "site").warnings(ws)
     assert(
       warnings.any { w => w.contains("18093->53/udp is not published") }
         and warnings.any { w => w.contains("bind mount /var/run/docker.sock is not mounted") }
@@ -634,10 +637,10 @@ type E2e {
       .projects(ws)
       .get(key: "stack")
       .services(ws)
-      .subset(keys: ["web"])
+      .subset(keys: ["site"])
       .batch
       .injectServices(ws)
-      .withExec(["sh", "-c", "wget -qO- http://web:80/ && wget -qO- http://api:80 | grep -m1 Hostname"])
+      .withExec(["sh", "-c", "wget -qO- http://site:80/ && wget -qO- http://api:80 | grep -m1 Hostname"])
       .stdout
     assert(
       injected.contains("from the bind mount") and injected.contains("Hostname"),
@@ -670,6 +673,105 @@ type E2e {
     let services = project.services(ws)
     assert(same(services.keys, ["app", "extra"]), "service keys: " + services.keys.join(", "))
     run(services.batch.buildService(ws))
+    null
+  }
+
+  """
+  The composeFiles setting replaces the standard file names: its first file
+  marks a project, the ones present are merged in order, and every Compose
+  run reads them instead of the standard file next to them.
+  """
+  composeFilesCheck: Void @check {
+    let ws = directory
+      # Invalid, so a Compose run that reads it instead of the test stack
+      # fails.
+      .withNewFile("e2e/docker-compose.yml", lines(["services: [", "  dev:"]))
+      .withNewFile(
+        "e2e/testing-docker-compose.yml",
+        lines(["services:", "  app:", "    build:", "      context: .", "      target: one"]),
+      )
+      .withNewFile(
+        "e2e/testing-docker-compose.ci.yml",
+        lines(["services:", "  app:", "    build:", "      target: two", "  extra:", "    image: alpine:3.20"]),
+      )
+      .withNewFile(
+        "e2e/Dockerfile",
+        lines(["FROM alpine:3.20 AS one", "RUN exit 3", "", "FROM alpine:3.20 AS two", "RUN true"]),
+      )
+      .withNewFile("solo/testing-docker-compose.yml", lines(["services:", "  web:", "    image: alpine:3.20"]))
+      .withNewFile("plain/compose.yaml", lines(["services:", "  db:", "    image: alpine:3.20"]))
+      .asWorkspace
+    let standard = docker.compose.projects(ws).keys
+    assert(same(standard, ["e2e", "plain"]), "projects without composeFiles: " + standard.join(", "))
+
+    let custom = docker(composeFiles: ["testing-docker-compose.yml", "testing-docker-compose.ci.yml"])
+      .compose
+      .projects(ws)
+    assert(same(custom.keys, ["e2e", "solo"]), "projects with composeFiles: " + custom.keys.join(", "))
+    let project = custom.get(key: "e2e")
+    assert(project.configPath(ws) == "e2e/testing-docker-compose.yml", "configPath: " + project.configPath(ws))
+    assert(project.overridePath(ws) == "e2e/testing-docker-compose.ci.yml", "overridePath")
+    let services = project.services(ws)
+    assert(same(services.keys, ["app", "extra"]), "service keys: " + services.keys.join(", "))
+    # lint and build fail if Compose reads docker-compose.yml, and the build
+    # fails if the second file isn't merged.
+    run(custom.batch.lint(ws))
+    run(services.batch.buildService(ws))
+    assert(same(custom.get(key: "solo").services(ws).keys, ["web"]), "a missing later file is skipped")
+
+    let bad = {
+      docker(composeFiles: ["test/compose.yml"]).compose.projects(ws).keys.join(",")
+    } rescue {
+      err: Error => err.message
+    }
+    assert(bad.contains("composeFiles takes file names"), "a path in composeFiles: " + bad)
+    null
+  }
+
+  """
+  With hostGateway set, a service reaches it under the names its extra_hosts
+  map to host-gateway; localhost and fixed addresses are warned about, and
+  without the setting so are the host-gateway entries.
+  """
+  hostGatewayCheck: Void @check {
+    let ws = directory
+      .withNewFile(
+        "gw/compose.yaml",
+        lines([
+          "services:",
+          "  caller:",
+          "    image: busybox:1.36",
+          "    command: [\"sh\", \"-c\", \"mkdir -p /www && wget -qO /www/index.html http://host.docker.internal/ && httpd -f -p 80 -h /www\"]",
+          "    expose: [\"80\"]",
+          "    extra_hosts:",
+          "      - \"host.docker.internal:host-gateway\"",
+          "      - \"localhost:host-gateway\"",
+          "      - \"db.example:10.0.0.5\"",
+        ]),
+      )
+      .asWorkspace
+    let host = container.from("traefik/whoami:v1.11").withExposedPort(80).asService
+    let gw = docker(hostGateway: host, composeBase: container.from("alpine:3.20"))
+      .compose
+      .projects(ws)
+      .get(key: "gw")
+      .services(ws)
+    let warnings = gw.get(key: "caller").warnings(ws)
+    assert(
+      same(warnings, [
+        "extra_hosts db.example:10.0.0.5 is ignored: only host-gateway entries are",
+        "extra_hosts localhost:host-gateway is ignored: localhost stays the service's own loopback",
+      ]),
+      "warnings with hostGateway: " + warnings.join("; "),
+    )
+    let fetched = gw.batch.injectServices(ws).withExec(["wget", "-qO-", "http://caller/"]).stdout
+    assert(fetched.contains("Hostname"), "the service did not reach hostGateway: " + fetched)
+
+    let unset = docker.compose.projects(ws).get(key: "gw").services(ws).get(key: "caller").warnings(ws)
+    assert(
+      unset.any { w => w == "extra_hosts host.docker.internal:host-gateway is ignored: set hostGateway to reach the host" },
+      "warnings without hostGateway: " + unset.join("; "),
+    )
     null
   }
 

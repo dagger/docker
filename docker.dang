@@ -200,13 +200,15 @@ type Docker {
   }
 
   """
-  Spawn an ephemeral Docker Engine in a container.
+  Run a Docker Engine as a service. Bind it to a client container with
+  withServiceBinding("dockerd", engine), then set DOCKER_HOST to
+  tcp://dockerd:2375. The API uses plaintext TCP on the service network.
   """
   engine(
     """
     Docker Engine version.
     """
-    version: String! = "24.0",
+    version: String! = "29.9.2",
     """
     Persist the state of the engine in a cache volume.
     """
@@ -219,6 +221,7 @@ type Docker {
     let base = container
       .from("index.docker.io/docker:" + version + "-dind")
       .withoutEntrypoint
+      .withEnvVariable("DOCKER_TLS_CERTDIR", "")
       .withExposedPort(2375)
     let engineContainer = if (persist) {
       let volumeName = "docker-engine-state-" + version + (
@@ -230,6 +233,7 @@ type Docker {
     }
     engineContainer.asService(
       args: [
+        "dockerd-entrypoint.sh",
         "dockerd",
         "--host=tcp://0.0.0.0:2375",
         "--host=unix:///var/run/docker.sock",
@@ -292,13 +296,13 @@ type Docker {
     """
     Version of the Docker CLI to run.
     """
-    version: String! = "24.0",
+    version: String! = "29.9.2",
     """
     Specify the Docker Engine to connect to. By default, run an ephemeral engine.
     """
     engine: Service = null,
   ): CLI! {
-    CLI(engine: engine ?? self.engine(version: version))
+    CLI(engine: engine ?? self.engine(version: version), version: version)
   }
 }
 
@@ -306,6 +310,11 @@ type Docker {
 A Docker client.
 """
 type CLI {
+  """
+  Version of the Docker CLI image.
+  """
+  version: String! = "29.9.2"
+
   """
   The Docker Engine this client is wired to.
   """
@@ -317,7 +326,7 @@ type CLI {
   container: Container! {
     Dagger
       .container
-      .from("index.docker.io/docker:cli")
+      .from("index.docker.io/docker:" + version + "-cli")
       .withoutEntrypoint
       .withServiceBinding("dockerd", engine)
       .withEnvVariable("DOCKER_HOST", "tcp://dockerd:2375")

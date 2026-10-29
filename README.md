@@ -367,6 +367,31 @@ dagger -c 'docker | projects | get app | all-stages | name'
 
 ## Docker engine and CLI
 
+Bind the top-level `engine()` service to any container with the Docker CLI
+installed, and set `DOCKER_HOST` to the binding's hostname on port 2375:
+
+```dang
+container
+  .from("docker:29.9.2-cli")
+  .withoutEntrypoint
+  .withServiceBinding("dockerd", docker.engine(persist: false))
+  .withEnvVariable("DOCKER_HOST", "tcp://dockerd:2375")
+  .withExec(["docker", "run", "--rm", "alpine:3.20", "echo", "hello"])
+  .stdout
+```
+
+The engine and CLI default to Docker 29.9.2; pass `version` to choose another
+release. The service exposes a plaintext Docker API on the Dagger service
+network. By default, engine state is cached in `/var/lib/docker`, keyed by
+version and optional `namespace`, with exclusive access. Use separate
+namespaces for independent engines, or `persist: false` for disposable state.
+
+Run the engine e2e checks:
+
+```sh
+dagger check --check engine-check --check ephemeral-engine-check
+```
+
 | Function                                             | Returns                                                              |
 | ---------------------------------------------------- | -------------------------------------------------------------------- |
 | `engine(version, persist, namespace)`                | an ephemeral Docker engine (Docker-in-Docker) as a `Service`         |

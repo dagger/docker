@@ -5,6 +5,44 @@ Every fixture is built in code as a small workspace, so the repository's own
 dagger check never sees the failing ones.
 """
 type E2e {
+  """
+  A separate client can build an image and run a container through the
+  engine service, including a RUN step that exercises nested containers.
+  """
+  let exerciseEngine(engine: Service!, version: String!): Void {
+    let client = container
+      .from("docker:" + version + "-cli")
+      .withoutEntrypoint
+      .withServiceBinding("dockerd", engine)
+      .withEnvVariable("DOCKER_HOST", "tcp://dockerd:2375")
+      .withNewFile("/src/Dockerfile", lines([
+        "FROM alpine:3.20",
+        "RUN echo engine-ok > /message",
+        "CMD [\"cat\", \"/message\"]",
+      ]))
+      .withWorkdir("/src")
+    let out = client
+      .withExec(["sh", "-ec", "docker version --format '{{.Server.Version}}'; docker build -t dagger-engine-e2e . >&2; docker run --rm dagger-engine-e2e"])
+      .stdout
+    assert(out.trimSpace == version + "\nengine-ok", "engine client output: " + out)
+    null
+  }
+
+  """
+  The default engine uses a persistent, namespaced cache and works as a
+  service binding on an independently created Docker client container.
+  """
+  engineCheck: Void @check {
+    exerciseEngine(docker.engine(namespace: "e2e-engine"), "29.9.2")
+  }
+
+  """
+  An engine can also run without a cache and with an explicit version.
+  """
+  ephemeralEngineCheck: Void @check {
+    exerciseEngine(docker.engine(version: "28.5.2", persist: false), "28.5.2")
+  }
+
   let assert(condition: Boolean!, message: String!): Void {
     if (condition == false) { raise message }
     null

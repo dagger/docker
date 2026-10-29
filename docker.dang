@@ -28,6 +28,21 @@ type Docker {
   composeImage: String! = "docker.io/docker/compose-bin:v5.5.0"
 
   """
+  Compose file names to use instead of the standard ones, as with 'docker
+  compose -f', e.g. ["testing-docker-compose.yml"]. A directory holding the
+  first is a Compose project; Compose merges the ones present in it, in
+  order, and no override file. Empty uses compose.yaml and its variants.
+  """
+  composeFiles: [String!]! = []
+
+  """
+  Service that Compose services reach under the names their extra_hosts map
+  to host-gateway, e.g. "tcp://localhost:8080" for a process on your machine.
+  Unset, those entries are ignored with a warning.
+  """
+  hostGateway: Service
+
+  """
   Container that Compose services are attached to by injectServices.
   A blank container by default; override it in dagger.toml, e.g.
 
